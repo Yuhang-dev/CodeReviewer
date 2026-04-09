@@ -31,11 +31,16 @@ def init_llm() -> ChatOpenAI:
 
 def review_code_step(state: AgentState):
     """Placeholder node for reviewing code via LLM."""
-    logger.info("Executing review_code_step in LangGraph...")
-    # llm = init_llm()
-    # response = llm.invoke([HumanMessage(content=f"Review this diff:\\n{state['diff_text']}")])
-    # return {"review_result": response.content}
-    return {"review_result": "Simulated AI Code Review Feedback..."}
+    logger.info("Executing review_code_step in LangGraph. Testing LLM connection for weather info...")
+    llm = init_llm()
+    
+    try:
+        response = llm.invoke([HumanMessage(content="Hello! Please give me a brief, random weather info report as a test.")])
+        logger.info(f"LLM API Test passed. Response: {response.content}")
+        return {"review_result": response.content}
+    except Exception as e:
+        logger.error(f"LLM API Test failed: {e}")
+        return {"review_result": f"LLM Connection Error: {str(e)}"}
 
 def build_review_graph() -> StateGraph:
     """Constructs the Agentic RAG review workflow."""
