@@ -185,6 +185,7 @@ def build_chat_graph() -> StateGraph:
 chat_graph = build_chat_graph()
 
 def nosenese():
+    print("nosesenese")
     return "nosenese"
 
 # def trigger_chat_pipeline(diff_text: str, chat_query: str) -> str:
