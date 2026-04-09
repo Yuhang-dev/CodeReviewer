@@ -47,11 +47,11 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     
     logger.info(f"Received GitHub webhook event: {event_type}")
 
-    # For testing purposes, we will trigger on both PRs and standard Push events
-    if event_type == "pull_request" or event_type == "push":
-        action = payload.get("action", "push_action")
-        
-        logger.info(f"Processing event: {event_type}, action: {action}")
+    # We typically only care about PR opened/synchronized events for code review
+    if event_type == "pull_request":
+        action = payload.get("action")
+        if action in ["opened", "synchronize", "reopened"]:
+            logger.info(f"Processing PR event for action: {action}")
         # 3. Process the Diff and Run Graph Pipeline in background
         def background_job():
             try:
