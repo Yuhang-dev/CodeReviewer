@@ -47,20 +47,20 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     
     logger.info(f"Received GitHub webhook event: {event_type}")
 
-    # We typically only care about PR opened/synchronized events for code review
-    if event_type == "pull_request":
-        action = payload.get("action")
-        if action in ["opened", "synchronize", "reopened"]:
-            logger.info(f"Processing PR event for action: {action}")
-            # 3. Process the Diff and Run Graph Pipeline in background
-            def background_job():
-                try:
-                    diff_texts = parse_pr_diff(payload)
-                    trigger_review_pipeline(diff_texts)
-                except Exception as e:
-                    logger.error(f"Error executing review pipeline: {e}")
+    # For testing purposes, we will trigger on both PRs and standard Push events
+    if event_type == "pull_request" or event_type == "push":
+        action = payload.get("action", "push_action")
+        
+        logger.info(f"Processing event: {event_type}, action: {action}")
+        # 3. Process the Diff and Run Graph Pipeline in background
+        def background_job():
+            try:
+                diff_texts = parse_pr_diff(payload)
+                trigger_review_pipeline(diff_texts)
+            except Exception as e:
+                logger.error(f"Error executing review pipeline: {e}")
 
-            background_tasks.add_task(background_job)
-            return {"status": "accepted", "message": "Code review pipeline triggered"}
+        background_tasks.add_task(background_job)
+        return {"status": "accepted", "message": "Code review pipeline triggered"}
             
     return {"status": "ignored", "message": "Event type or action not handled"}
