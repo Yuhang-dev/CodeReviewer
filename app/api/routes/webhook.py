@@ -3,8 +3,9 @@ import hashlib
 import logging
 from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
 from app.core.config import settings
-from app.services.github import fetch_pr_diff, post_pr_comment
+from app.services.github import fetch_pr_diff, post_pr_comment, fetch_pr_head_commit, post_pr_review
 from app.services.rag import trigger_review_pipeline
+import json
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -69,10 +70,24 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
                     
                     # trigger_review_pipeline is synchronous
                     result_state = trigger_review_pipeline([diff_text])
-                    review_comment = result_state.get("review_result", "No review generated.")
+                    review_result_str = result_state.get("review_result", "[]")
                     
-                    # Post review comment back to GitHub
-                    await post_pr_comment(repo_full_name, pr_number, review_comment)
+                    # Try to parse as JSON for inline comments
+                    try:
+                        review_comments = json.loads(review_result_str)
+                        if isinstance(review_comments, list) and len(review_comments) > 0 and "line" in review_comments[0]:
+                            commit_id = await fetch_pr_head_commit(repo_full_name, pr_number)
+                            await post_pr_review(repo_full_name, pr_number, commit_id, review_comments)
+                            return
+                    except json.JSONDecodeError:
+                        pass
+                        
+                    # Fallback to general comment if JSON is invalid, or if it is empty, or if it didn't look like our structure
+                    if len(review_result_str.strip()) < 5 and ("[" in review_result_str):
+                        review_result_str = "无可挑剔，LGTM👍"
+                    
+                    # Also fallback if it's not a list, etc.
+                    await post_pr_comment(repo_full_name, pr_number, review_result_str)
                 except Exception as e:
                     logger.error(f"Error executing review pipeline: {e}")
 
