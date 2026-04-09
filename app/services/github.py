@@ -101,12 +101,12 @@ async def post_pr_review(repo_full_name: str, pr_number: int, commit_id: str, re
         "event": "COMMENT",
         "comments": [
             {
-                "path": c.get("file", c.get("path", "")),
+                "path": c.get("path", c.get("file", "")),
                 "line": int(c.get("line")),
                 "body": c.get("comment", c.get("body", ""))
             }
             for c in review_comments
-            if c.get("line") and (c.get("file") or c.get("path"))
+            if c.get("line") and (c.get("path") or c.get("file"))
         ]
     }
     

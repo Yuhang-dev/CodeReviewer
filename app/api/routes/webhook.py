@@ -73,16 +73,34 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
                     review_result_str = result_state.get("review_result", "[]")
                     
                     # Try to parse as JSON for inline comments
+                    inline_success = False
                     try:
                         review_comments = json.loads(review_result_str)
                         if isinstance(review_comments, list) and len(review_comments) > 0 and "line" in review_comments[0]:
                             commit_id = await fetch_pr_head_commit(repo_full_name, pr_number)
+                            # Fix path issues (remove a/ or b/ prefixes)
+                            for c in review_comments:
+                                p = c.get("file", c.get("path", ""))
+                                if p.startswith("a/") or p.startswith("b/"):
+                                    c["path"] = p[2:]
+                                elif "file" in c:
+                                    c["path"] = c["file"]
+                            
                             await post_pr_review(repo_full_name, pr_number, commit_id, review_comments)
-                            return
-                    except json.JSONDecodeError:
-                        pass
+                            inline_success = True
+                    except Exception as e:
+                        logger.warning(f"Failed to post inline review (fallback to general): {e}")
+                        # Prettify the JSON into markdown before falling back
+                        if isinstance(review_comments, list):
+                            fallback_md = "⚠️ **无法精确定位代码行，改用全局评论：**\n\n"
+                            for c in review_comments:
+                                fallback_md += f"- **{c.get('file', 'Unknown File')}** (Line {c.get('line', '?')}): {c.get('comment', '')}\n"
+                            review_result_str = fallback_md
                         
-                    # Fallback to general comment if JSON is invalid, or if it is empty, or if it didn't look like our structure
+                    if inline_success:
+                        return
+                        
+                    # Fallback to general comment if JSON is invalid, or if inline posting failed
                     if len(review_result_str.strip()) < 5 and ("[" in review_result_str):
                         review_result_str = "无可挑剔，LGTM👍"
                     
