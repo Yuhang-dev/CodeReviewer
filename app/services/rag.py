@@ -16,6 +16,8 @@ COLLECTION_NAME = "code_guidelines"
 class AgentState(TypedDict):
     diff_text: str
     review_result: str
+    chat_query: str
+    chat_response: str
 
 def init_qdrant() -> QdrantClient:
     """Initialize connection to Qdrant vector database."""
@@ -113,10 +115,14 @@ def review_code_step(state: AgentState):
     llm = init_llm()
     try:
         prompt = (
-            f"请使用**中文**审查以下代码变更，重点针对潜在的 Bug、代码安全性、可读性和性能问题提供专业的反馈和改进建议。\n"
+            f"请使用**中文**审查以下代码变更。你是一位极其干练的资深工程师，你的 Review 必须符合以下要求：\n"
+            f"1. 极度精简，TL;DR 风格，绝不说废话。\n"
+            f"2. 只指出致命 Bug、安全问题或严重违背规范的地方。如果是小问题用一句话带过。\n"
+            f"3. 必须精准定位问题（说明文件名或函数名）。\n"
+            f"4. 如果代码写得不错，直接回复 'LGTM👍' (Looks Good To Me) 即可，不要强行找茬。\n\n"
             f"{context_str}"
             f"【代码 Diff 变更】:\n{state['diff_text']}\n\n"
-            f"请保持排版清晰（必要时使用 Markdown）:"
+            f"请输出你的精简审查意见:"
         )
         response = llm.invoke([HumanMessage(content=prompt)])
         
@@ -139,5 +145,42 @@ graph = build_review_graph()
 def trigger_review_pipeline(diff_list: list[str]):
     logger.info(f"Triggering Agentic RAG pipeline for {len(diff_list)} chunks...")
     combined_diff = "\n".join(diff_list)
-    initial_state = {"diff_text": combined_diff, "review_result": ""}
+    initial_state = {"diff_text": combined_diff, "review_result": "", "chat_query": "", "chat_response": ""}
     return graph.invoke(initial_state)
+
+def chat_step(state: AgentState):
+    """LangGraph node: Answers developer questions about the code/review."""
+    logger.info("Executing chat_step...")
+    llm = init_llm()
+    try:
+        prompt = (
+            f"你是一个资深 AI Code Reviewer，正在与开发者就 PR 进行对话。\n"
+            f"【PR Diff 背景】:\n{state.get('diff_text', '暂无代码')}\n\n"
+            f"【开发者的问题】:\n{state.get('chat_query')}\n\n"
+            f"请简洁专业地回答（请精简，直接切入正题，尽量提供代码示例）。"
+        )
+        response = llm.invoke([HumanMessage(content=prompt)])
+        return {"chat_response": response.content}
+    except Exception as e:
+        logger.error(f"LLM API Error during chat: {e}")
+        return {"chat_response": f"LLM Connection Error: {str(e)}"}
+
+def build_chat_graph() -> StateGraph:
+    workflow = StateGraph(AgentState)
+    workflow.add_node("chat_node", chat_step)
+    workflow.set_entry_point("chat_node")
+    workflow.add_edge("chat_node", END)
+    return workflow.compile()
+
+chat_graph = build_chat_graph()
+
+def trigger_chat_pipeline(diff_text: str, chat_query: str) -> str:
+    logger.info(f"Triggering Agentic Chat pipeline...")
+    initial_state = {
+        "diff_text": diff_text, 
+        "chat_query": chat_query, 
+        "review_result": "", 
+        "chat_response": ""
+    }
+    result = chat_graph.invoke(initial_state)
+    return result.get("chat_response", "Sorry, I couldn't process that.")

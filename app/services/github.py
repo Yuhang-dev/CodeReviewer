@@ -56,3 +56,22 @@ async def post_pr_comment(repo_full_name: str, pr_number: int, comment_body: str
             logger.error(f"GitHub API POST Error [{response.status_code}]: {response.text}")
         response.raise_for_status()
         logger.info(f"Comment successfully posted. URL: {response.json().get('html_url')}")
+
+async def fetch_issue_comments(repo_full_name: str, pr_number: int) -> list[str]:
+    """
+    Fetches the history of issue comments for a PR to provide chat context.
+    Returns a list of comment bodies.
+    """
+    logger.info(f"Fetching issue comments for {repo_full_name}#{pr_number}...")
+    async with await get_github_client() as client:
+        response = await client.get(
+            f"/repos/{repo_full_name}/issues/{pr_number}/comments"
+        )
+        if response.status_code >= 400:
+            logger.error(f"GitHub API GET Comments Error [{response.status_code}]: {response.text}")
+            return []
+        
+        comments_data = response.json()
+        # Extract body from each comment
+        # We can also filter out bot's own comments or keep them to let AI know its past answers
+        return [c.get("body", "") for c in comments_data]
