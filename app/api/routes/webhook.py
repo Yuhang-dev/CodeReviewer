@@ -3,7 +3,7 @@ import hashlib
 import logging
 from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
 from app.core.config import settings
-from app.services.github import parse_pr_diff
+from app.services.github import fetch_pr_diff, post_pr_comment
 from app.services.rag import trigger_review_pipeline
 
 router = APIRouter()
@@ -49,18 +49,34 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
 
     # We typically only care about PR opened/synchronized events for code review
     if event_type == "pull_request":
+        sender = payload.get("sender", {}).get("login", "")
+        # Prevent infinite loops if the bot itself modifies the PR (e.g. "bot" suffix users)
+        if "bot" in sender.lower() or sender == "github-actions[bot]":
+            logger.info(f"Ignoring PR event triggered by a bot: {sender}")
+            return {"status": "ignored", "message": "Ignored bot event."}
+
         action = payload.get("action")
         if action in ["opened", "synchronize", "reopened"]:
-            logger.info(f"Processing PR event for action: {action}")
-        # 3. Process the Diff and Run Graph Pipeline in background
-        def background_job():
-            try:
-                diff_texts = parse_pr_diff(payload)
-                trigger_review_pipeline(diff_texts)
-            except Exception as e:
-                logger.error(f"Error executing review pipeline: {e}")
+            repo_full_name = payload["repository"]["full_name"]
+            pr_number = payload["pull_request"]["number"]
+            logger.info(f"Processing PR event for {repo_full_name}#{pr_number}, action: {action}")
+            
+            # 3. Process the Diff and Run Graph Pipeline in background
+            async def background_job():
+                try:
+                    # Fetch real diff patch
+                    diff_text = await fetch_pr_diff(repo_full_name, pr_number)
+                    
+                    # trigger_review_pipeline is synchronous
+                    result_state = trigger_review_pipeline([diff_text])
+                    review_comment = result_state.get("review_result", "No review generated.")
+                    
+                    # Post review comment back to GitHub
+                    await post_pr_comment(repo_full_name, pr_number, review_comment)
+                except Exception as e:
+                    logger.error(f"Error executing review pipeline: {e}")
 
-        background_tasks.add_task(background_job)
-        return {"status": "accepted", "message": "Code review pipeline triggered"}
+            background_tasks.add_task(background_job)
+            return {"status": "accepted", "message": "Code review pipeline triggered"}
             
     return {"status": "ignored", "message": "Event type or action not handled"}

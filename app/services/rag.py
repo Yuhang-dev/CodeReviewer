@@ -31,15 +31,18 @@ def init_llm() -> ChatOpenAI:
 
 def review_code_step(state: AgentState):
     """Placeholder node for reviewing code via LLM."""
-    logger.info("Executing review_code_step in LangGraph. Testing LLM connection for weather info...")
+    logger.info("Executing review_code_step in LangGraph. Reviewing PR diff...")
     llm = init_llm()
     
     try:
-        response = llm.invoke([HumanMessage(content="Hello! Please give me a brief, random weather info report as a test.")])
-        logger.info(f"LLM API Test passed. Response: {response.content}")
+        # Build prompt using the diff payload from the StateGraph
+        prompt = f"Please review the following code changes and provide feedback on potential bugs, readability, and performance issues:\n\n{state['diff_text']}"
+        response = llm.invoke([HumanMessage(content=prompt)])
+        
+        logger.info(f"Code Review completed by LLM.")
         return {"review_result": response.content}
     except Exception as e:
-        logger.error(f"LLM API Test failed: {e}")
+        logger.error(f"LLM API Error during code review: {e}")
         return {"review_result": f"LLM Connection Error: {str(e)}"}
 
 def build_review_graph() -> StateGraph:

@@ -5,6 +5,7 @@ class Settings(BaseSettings):
     
     # GitHub Webhook settings
     GITHUB_WEBHOOK_SECRET: str = ""
+    GITHUB_TOKEN: str = ""
     
     # DeepSeek / LangChain settings
     DEEPSEEK_API_KEY: str = ""

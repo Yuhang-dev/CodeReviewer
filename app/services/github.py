@@ -1,21 +1,54 @@
 import logging
+import httpx
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-def parse_pr_diff(pr_payload: dict) -> list[str]:
+async def get_github_client() -> httpx.AsyncClient:
+    """Returns an configured httpx client for GitHub API."""
+    headers = {
+        "Accept": "application/vnd.github.v3+json",
+        "X-GitHub-Api-Version": "2022-11-28"
+    }
+    if settings.GITHUB_TOKEN:
+        headers["Authorization"] = f"Bearer {settings.GITHUB_TOKEN}"
+        
+    return httpx.AsyncClient(
+        base_url="https://api.github.com",
+        headers=headers,
+        timeout=30.0
+    )
+
+
+async def fetch_pr_diff(repo_full_name: str, pr_number: int) -> str:
     """
-    Simulates parsing the Git diff files from a GitHub Pull Request payload.
-    In a real implementation, this would:
-    1. Extract PR number and repository from `pr_payload`
-    2. Call GitHub API to fetch the PR's patch/diff
-    3. Parse the diff to extract changed files, added/removed lines, etc.
+    Fetches the raw diff patch for a given pull request.
     """
-    logger.info("Simulating git diff text extraction for PR event...")
+    logger.info(f"Fetching PR diff for {repo_full_name}#{pr_number}...")
     
-    # Placeholder diff data
-    mock_diff = [
-        "diff --git a/app/main.py b/app/main.py\n--- a/app/main.py\n+++ b/app/main.py\n@@ -1,3 +1,4 @@\n+print('Added new feature')",
-        "diff --git a/utils/helper.py b/utils/helper.py\n--- a/utils/helper.py\n+++ b/utils/helper.py\n@@ -10,3 +10,4 @@\n-def old_func(): pass\n+def new_func(): return True"
-    ]
+    async with await get_github_client() as client:
+        # To get the diff, we override the Accept header
+        response = await client.get(
+            f"/repos/{repo_full_name}/pulls/{pr_number}",
+            headers={"Accept": "application/vnd.github.v3.diff"}
+        )
+        response.raise_for_status()
+        diff_text = response.text
+        logger.info(f"Successfully fetched diff ({len(diff_text)} chars).")
+        return diff_text
+
+
+async def post_pr_comment(repo_full_name: str, pr_number: int, comment_body: str):
+    """
+    Posts a general issue comment to the PR.
+    (In GitHub, PRs are backed by Issues, so Issue comments appear in the PR timeline).
+    """
+    logger.info(f"Posting comment to {repo_full_name}#{pr_number}...")
     
-    return mock_diff
+    async with await get_github_client() as client:
+        response = await client.post(
+            f"/repos/{repo_full_name}/issues/{pr_number}/comments",
+            json={"body": comment_body}
+        )
+        response.raise_for_status()
+        logger.info(f"Comment successfully posted. URL: {response.json().get('html_url')}")
