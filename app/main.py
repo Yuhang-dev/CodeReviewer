@@ -9,8 +9,10 @@ from app.core.config import settings
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def create_app() -> FastAPI:
+def create_app():
     app = FastAPI(title=settings.PROJECT_NAME)
+
+    print("Here")
 
     app.add_middleware(
         CORSMiddleware,
@@ -21,8 +23,9 @@ def create_app() -> FastAPI:
     )
 
     # Include routes
+    from app.api.routes import webhook, knowledge
     app.include_router(webhook.router, prefix="/webhook", tags=["webhooks"])
-
+    app.include_router(knowledge.router, prefix="/knowledge", tags=["knowledge"])
     @app.get("/health")
     async def health_check():
         return {"status": "healthy"}
