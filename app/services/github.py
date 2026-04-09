@@ -32,6 +32,8 @@ async def fetch_pr_diff(repo_full_name: str, pr_number: int) -> str:
             f"/repos/{repo_full_name}/pulls/{pr_number}",
             headers={"Accept": "application/vnd.github.v3.diff"}
         )
+        if response.status_code >= 400:
+            logger.error(f"GitHub API GET Error [{response.status_code}]: {response.text}")
         response.raise_for_status()
         diff_text = response.text
         logger.info(f"Successfully fetched diff ({len(diff_text)} chars).")
@@ -50,5 +52,7 @@ async def post_pr_comment(repo_full_name: str, pr_number: int, comment_body: str
             f"/repos/{repo_full_name}/issues/{pr_number}/comments",
             json={"body": comment_body}
         )
+        if response.status_code >= 400:
+            logger.error(f"GitHub API POST Error [{response.status_code}]: {response.text}")
         response.raise_for_status()
         logger.info(f"Comment successfully posted. URL: {response.json().get('html_url')}")
