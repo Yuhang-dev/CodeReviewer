@@ -116,21 +116,31 @@ def review_code_step(state: AgentState):
     try:
         prompt = (
             f"请使用**中文**审查以下代码变更。你是一位极其干练的资深工程师，你的 Review 必须符合以下要求：\n"
-            f"1. 极度精简，TL;DR 风格，绝不说废话。\n"
-            f"2. 只指出致命 Bug、安全问题或严重违背规范的地方。如果是小问题用一句话带过。\n"
-            f"3. 必须精准定位问题（说明文件名或函数名）。\n"
-            f"4. 如果代码写得不错，直接回复 'LGTM👍' (Looks Good To Me) 即可，不要强行找茬。\n\n"
+            f"1. 极度精简，只指出致命 Bug、安全问题或严重违背规范的地方。\n"
+            f"2. 如果没有问题发空数组 []。\n"
+            f"3. 你的输出【必须】是严谨的 JSON 数组结构，不能包含多余的 Markdown 格式，例如：\n"
+            f'   [{{\"file\": \"path/to/file.py\", \"line\": 15, \"comment\": \"你的具体批注\"}}]\n\n'
+            f"4. 务必确保 JSON 格式合法（用双引号包裹键名）。\n\n"
             f"{context_str}"
             f"【代码 Diff 变更】:\n{state['diff_text']}\n\n"
-            f"请输出你的精简审查意见:"
+            f"精简 JSON 审查意见:"
         )
         response = llm.invoke([HumanMessage(content=prompt)])
+        raw_text = response.content.strip()
         
+        # Simple extraction logic for markdown wrapped json
+        import re
+        json_match = re.search(r'\[\s*\{.*?\}\s*\]', raw_text, re.DOTALL)
+        if json_match:
+            raw_text = json_match.group(0)
+        elif raw_text.startswith("```json"):
+            raw_text = raw_text[7:].strip("`\n ")
+            
         logger.info(f"Code Review completed by LLM.")
-        return {"review_result": response.content}
+        return {"review_result": raw_text}
     except Exception as e:
         logger.error(f"LLM API Error during code review: {e}")
-        return {"review_result": f"LLM Connection Error: {str(e)}"}
+        return {"review_result": "[]"}
 
 
 def build_review_graph() -> StateGraph:
@@ -173,6 +183,9 @@ def build_chat_graph() -> StateGraph:
     return workflow.compile()
 
 chat_graph = build_chat_graph()
+
+def nosenese():
+    return "nosenese"
 
 # def trigger_chat_pipeline(diff_text: str, chat_query: str) -> str:
 #     logger.info(f"Triggering Agentic Chat pipeline...")
