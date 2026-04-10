@@ -15,6 +15,10 @@ COLLECTION_NAME = "code_guidelines"
 
 class AgentState(TypedDict):
     diff_text: str
+    full_files_context: str
+    tier: str
+    review_context: str
+    review_focus: str
     review_result: str
     chat_query: str
     chat_response: str
@@ -111,17 +115,42 @@ def review_code_step(state: AgentState):
     if retrieved_context.strip():
         context_str = f"【企业代码规范参考】:\n{retrieved_context}\n\n请务必检查上述代码是否可能违反了上述规范要求。\n\n"
     
-    logger.info("Invoking LLM...")
+    tier = state.get("tier", "Tier-B")
+    review_context = state.get("review_context", "")
+    review_focus = state.get("review_focus", "")
+    
+    if tier == "TIER-C":
+        logger.info("Tier-C detected. Skipping LLM code review (auto LGTM).")
+        return {"review_result": "[]"}
+        
+    logger.info(f"Invoking LLM for {tier}...")
+    
+    # Base requirements
+    tier_requirements = ""
+    if tier == "TIER-S":
+        tier_requirements = "这是极核心/安全底层的代码，请【极其严苛】地审查并发状态、死锁、内存泄漏、防重放、越权和 SQL 注入等致命问题！不放过任何蛛丝马迹。"
+    elif tier == "TIER-A":
+        tier_requirements = "这是核心业务逻辑，请侧重检查异常边界条件、空指针、重试逻辑和幂等性是否有缺失。"
+    else:
+        tier_requirements = "请重点查验基础规范、Type Hints、命名和是否有明显错误即可。"
+        
+    user_focus_str = ""
+    if review_context or review_focus:
+        user_focus_str = f"【开发者说明】:\n背景: {review_context}\n焦点: {review_focus}\n\n请【务必】针对开发者的焦点(Focus)进行深度评估校验！\n\n"
+
     llm = init_llm()
     try:
         prompt = (
             f"请使用**中文**审查以下代码变更。你是一位极其干练的资深工程师，你的 Review 必须符合以下要求：\n"
-            f"1. 极度精简，只指出致命 Bug、安全问题或严重违背规范的地方。\n"
-            f"2. 如果没有问题发空数组 []。\n"
-            f"3. 你的输出【必须】是严谨的 JSON 数组结构，不能包含多余的 Markdown 格式，例如：\n"
+            f"1. 极度精简，只指出问题。\n"
+            f"2. {tier_requirements}\n"
+            f"3. 如果没有问题发空数组 []。\n"
+            f"4. 你的输出【必须】是严谨的 JSON 数组结构，不能包含多余的 Markdown 格式，例如：\n"
             f'   [{{\"file\": \"path/to/file.py\", \"line\": 15, \"comment\": \"你的具体批注\"}}]\n\n'
-            f"4. 务必确保 JSON 格式合法（用双引号包裹键名）。\n\n"
+            f"5. 务必确保 JSON 格式合法（用双引号包裹键名）。\n\n"
             f"{context_str}"
+            f"{user_focus_str}"
+            f"【完整文件上下文 (仅供参考)】:\n{state.get('full_files_context', '')}\n\n"
             f"【代码 Diff 变更】:\n{state['diff_text']}\n\n"
             f"精简 JSON 审查意见:"
         )
@@ -152,11 +181,88 @@ def build_review_graph() -> StateGraph:
 
 graph = build_review_graph()
 
-def trigger_review_pipeline(diff_list: list[str]):
-    logger.info(f"Triggering Agentic RAG pipeline for {len(diff_list)} chunks...")
-    combined_diff = "\n".join(diff_list)
-    initial_state = {"diff_text": combined_diff, "review_result": "", "chat_query": "", "chat_response": ""}
-    return graph.invoke(initial_state)
+def global_impact_step(state: AgentState):
+    """LangGraph node: Assesses cross-file backward compatibility."""
+    logger.info("Executing global_impact_step...")
+    llm = init_llm()
+    try:
+        prompt = (
+            f"你是一位全局架构师。请仅评估以下文件的修改是否会导致**全局接口破坏**或**向后不兼容**。\n"
+            f"不需要指出具体行数代码错误，只需给出一个宏观警告。\n"
+            f"如果影响不大，返回严格的空字符串。\n"
+            f"如果有影响，请输出一段纯文本警告内容。\n\n"
+            f"【代码 Diff 变更】:\n{state['diff_text']}"
+        )
+        response = llm.invoke([HumanMessage(content=prompt)])
+        return {"review_result": response.content.strip()}
+    except Exception as e:
+        logger.error(f"Global impact error: {e}")
+        return {"review_result": ""}
+
+global_graph = StateGraph(AgentState)
+global_graph.add_node("global_impact", global_impact_step)
+global_graph.set_entry_point("global_impact")
+global_graph.add_edge("global_impact", END)
+global_impact_graph = global_graph.compile()
+
+def trigger_review_pipeline(pr_files_data: list[dict], tier: str = "Tier-B", review_context: str = "", review_focus: str = "") -> dict:
+    """
+    Executes Local Review Agents natively concurrently per-file.
+    Optionally executes Global Impact Agent if tier mandates it.
+    Returns: {"comments": list[dict], "global_warning": str}
+    """
+    logger.info(f"Triggering Multi-Agent Map-Reduce pipeline for {len(pr_files_data)} files...")
+    if not pr_files_data:
+        return {"comments": [], "global_warning": ""}
+        
+    initial_states = []
+    combined_diffs = ""
+    for file_data in pr_files_data:
+        combined_diffs += f"\nFile: {file_data['filename']}\n{file_data['patch']}\n"
+        state = {
+            "diff_text": f"File: {file_data['filename']}\n{file_data['patch']}", 
+            "full_files_context": f"File: {file_data['filename']}\n{file_data['full_content']}",
+            "tier": tier,
+            "review_context": review_context,
+            "review_focus": review_focus,
+            "review_result": "", 
+            "chat_query": "", 
+            "chat_response": ""
+        }
+        initial_states.append(state)
+        
+    # 1. Parallel execution for Local File Reviewers
+    results = graph.batch(initial_states)
+    
+    all_reviews = []
+    import json
+    for result in results:
+        res_str = result.get("review_result", "[]")
+        if res_str:
+            try:
+                parsed = json.loads(res_str)
+                if isinstance(parsed, list):
+                    all_reviews.extend(parsed)
+            except json.JSONDecodeError:
+                pass
+
+    # 2. Sequential/Parallel Global Impact Analyzer (if tier allows)
+    global_warning = ""
+    if tier in ["TIER-S", "TIER-A"]:
+        gl_state = {
+            "diff_text": combined_diffs,
+            "full_files_context": "",
+            "tier": tier,
+            "review_context": review_context,
+            "review_focus": review_focus,
+            "review_result": "", 
+            "chat_query": "", 
+            "chat_response": ""
+        }
+        res = global_impact_graph.invoke(gl_state)
+        global_warning = res.get("review_result", "")
+        
+    return {"comments": all_reviews, "global_warning": global_warning}
 
 def chat_step(state: AgentState):
     """LangGraph node: Answers developer questions about the code/review."""
