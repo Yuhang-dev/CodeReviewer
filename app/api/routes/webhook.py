@@ -3,7 +3,7 @@ import hashlib
 import logging
 from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
 from app.core.config import settings
-from app.services.github import fetch_pr_diff, post_pr_comment, fetch_pr_head_commit, post_pr_review
+from app.services.github import post_pr_comment, fetch_pr_head_commit, post_pr_review
 from app.services.rag import trigger_review_pipeline
 import json
 
@@ -60,52 +60,83 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
         if action in ["opened", "synchronize", "reopened"]:
             repo_full_name = payload["repository"]["full_name"]
             pr_number = payload["pull_request"]["number"]
+            pr_body = payload["pull_request"].get("body", "") or ""
             logger.info(f"Processing PR event for {repo_full_name}#{pr_number}, action: {action}")
+            
+            # Parse Tiered Code Review Metadata
+            import re
+            tier = "Tier-B"
+            review_context = ""
+            review_focus = ""
+            
+            match = re.search(r'>>>REVIEW_METADATA<<<(.*?)(?:>>>END<<<|$)', pr_body, re.DOTALL)
+            if match:
+                meta_text = match.group(1).strip()
+                tier_match = re.search(r'Tier:\s*(Tier-[SABC])', meta_text, re.IGNORECASE)
+                if tier_match:
+                    tier = tier_match.group(1).upper()
+                
+                context_match = re.search(r'Context:\s*(.*?)(?=\n(?:Tier|Focus):|$)', meta_text, re.IGNORECASE | re.DOTALL)
+                if context_match:
+                    review_context = context_match.group(1).strip()
+                    
+                focus_match = re.search(r'Focus:\s*(.*?)(?=\n(?:Tier|Context):|$)', meta_text, re.IGNORECASE | re.DOTALL)
+                if focus_match:
+                    review_focus = focus_match.group(1).strip()
+                    
+            logger.info(f"Metadata parsed - Tier: {tier}, Focus: {review_focus}")
             
             # 3. Process the Diff and Run Graph Pipeline in background
             async def background_job():
                 try:
-                    # Fetch real diff patch
-                    diff_text = await fetch_pr_diff(repo_full_name, pr_number)
+                    # Fetch head commit ID early
+                    commit_id = await fetch_pr_head_commit(repo_full_name, pr_number)
+                    
+                    # Fetch structured files data per file (instead of pure diff mapping)
+                    from app.services.github import fetch_pr_files_data
+                    pr_files_data = await fetch_pr_files_data(repo_full_name, pr_number, commit_id)
                     
                     # trigger_review_pipeline is synchronous
-                    result_state = trigger_review_pipeline([diff_text])
-                    review_result_str = result_state.get("review_result", "[]")
+                    result_data = trigger_review_pipeline(
+                        pr_files_data, 
+                        tier=tier,
+                        review_context=review_context,
+                        review_focus=review_focus
+                    )
                     
-                    # Try to parse as JSON for inline comments
+                    review_comments = result_data.get("comments", [])
+                    global_warning = result_data.get("global_warning", "")
+                    
+                    if global_warning:
+                        await post_pr_comment(repo_full_name, pr_number, f"⚠️ **Global Impact Warning ( {tier} )** ⚠️\n\n{global_warning}")
+                    
                     inline_success = False
-                    try:
-                        review_comments = json.loads(review_result_str)
-                        if isinstance(review_comments, list) and len(review_comments) > 0 and "line" in review_comments[0]:
-                            commit_id = await fetch_pr_head_commit(repo_full_name, pr_number)
-                            # Fix path issues (remove a/ or b/ prefixes)
-                            for c in review_comments:
-                                p = c.get("file", c.get("path", ""))
-                                if p.startswith("a/") or p.startswith("b/"):
-                                    c["path"] = p[2:]
-                                elif "file" in c:
-                                    c["path"] = c["file"]
-                            
+                    if review_comments:
+                        # Fix path issues (remove a/ or b/ prefixes)
+                        for c in review_comments:
+                            p = c.get("file", c.get("path", ""))
+                            if p.startswith("a/") or p.startswith("b/"):
+                                c["path"] = p[2:]
+                            elif "file" in c:
+                                c["path"] = c["file"]
+                        
+                        try:
                             await post_pr_review(repo_full_name, pr_number, commit_id, review_comments)
                             inline_success = True
-                    except Exception as e:
-                        logger.warning(f"Failed to post inline review (fallback to general): {e}")
-                        # Prettify the JSON into markdown before falling back
-                        if isinstance(review_comments, list):
+                        except Exception as e:
+                            logger.warning(f"Failed to post inline review (fallback to general): {e}")
                             fallback_md = "⚠️ **无法精确定位代码行，改用全局评论：**\n\n"
                             for c in review_comments:
                                 fallback_md += f"- **{c.get('file', 'Unknown File')}** (Line {c.get('line', '?')}): {c.get('comment', '')}\n"
-                            review_result_str = fallback_md
-                        
+                            await post_pr_comment(repo_full_name, pr_number, fallback_md)
+                            inline_success = True  # We handled the fallback
+                            
                     if inline_success:
                         return
                         
-                    # Fallback to general comment if JSON is invalid, or if inline posting failed
-                    if len(review_result_str.strip()) < 5 and ("[" in review_result_str):
-                        review_result_str = "无可挑剔，LGTM👍"
-                    
-                    # Also fallback if it's not a list, etc.
-                    await post_pr_comment(repo_full_name, pr_number, review_result_str)
+                    # If empty
+                    if not review_comments:
+                        await post_pr_comment(repo_full_name, pr_number, f"AI Code Review completed ({tier}). LGTM! 👍")
                 except Exception as e:
                     logger.error(f"Error executing review pipeline: {e}")
 
