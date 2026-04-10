@@ -183,17 +183,3 @@ def build_chat_graph() -> StateGraph:
     return workflow.compile()
 
 chat_graph = build_chat_graph()
-
-def nosenese():
-    return "nosenese"
-
-# def trigger_chat_pipeline(diff_text: str, chat_query: str) -> str:
-#     logger.info(f"Triggering Agentic Chat pipeline...")
-#     initial_state = {
-#         "diff_text": diff_text,
-#         "chat_query": chat_query,
-#         "review_result": "",
-#         "chat_response": ""
-#     }
-#     result = chat_graph.invoke(initial_state)
-#     return result.get("chat_response", "Sorry, I couldn't process that.")
