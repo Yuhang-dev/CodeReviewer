@@ -1,6 +1,7 @@
 import re
 import logging
 from langchain_core.tools import tool
+from app.skills.diff_utils import parse_diff_line_map
 
 logger = logging.getLogger(__name__)
 
@@ -13,28 +14,31 @@ def type_hints_check(code_diff: str) -> str:
     """
     logger.info("[Skill] type_hints_check triggered.")
     
-    # Match function definitions that are missing return type or param types
-    # Pattern: def func_name(args) - without -> type at end
-    func_pattern = re.compile(
-        r'^\+.*def\s+(\w+)\s*\(([^)]*)\)\s*(?!->)',
-        re.MULTILINE
-    )
-    
+    line_map = parse_diff_line_map(code_diff)
     issues = []
-    for match in func_pattern.finditer(code_diff):
+
+    for diff_idx, raw_line in enumerate(code_diff.splitlines(), start=1):
+        if not raw_line.startswith('+') or raw_line.startswith('+++'):
+            continue
+        stripped = raw_line[1:].strip()
+
+        match = re.match(r'def\s+(\w+)\s*\(([^)]*)\)', stripped)
+        if not match:
+            continue
+        
         func_name = match.group(1)
         params = match.group(2).strip()
         
-        # Skip dunder methods and self/cls-only functions
+        # Skip dunder methods
         if func_name.startswith('__') and func_name.endswith('__'):
             continue
         
-        # Check if params have type hints (simple heuristic: look for ":" in params)
         params_list = [p.strip() for p in params.split(',') if p.strip() not in ('self', 'cls', '')]
         missing_hints = [p for p in params_list if ':' not in p and '*' not in p]
         
         if missing_hints:
-            issues.append(f"函数 `{func_name}` 参数缺少 Type Hints: {', '.join(missing_hints)}")
+            actual_line = line_map.get(diff_idx, diff_idx)
+            issues.append(f"第 {actual_line} 行函数 `{func_name}` 参数缺少 Type Hints: {', '.join(missing_hints)}")
     
     if not issues:
         return ""
