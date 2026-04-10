@@ -15,7 +15,9 @@ COLLECTION_NAME = "code_guidelines"
 
 # Load pluggable skills
 from app.skills.type_hints_check import type_hints_check
-AVAILABLE_SKILLS = [type_hints_check]
+from app.skills.print_statement_check import print_statement_check
+from app.skills.hardcoded_secrets_check import hardcoded_secrets_check
+AVAILABLE_SKILLS = [type_hints_check, print_statement_check, hardcoded_secrets_check]
 
 class AgentState(TypedDict):
     diff_text: str
@@ -132,15 +134,38 @@ def review_code_step(state: AgentState):
     
     # --- Run applicable Skills pre-LLM ---
     skill_findings_str = ""
-    # Type hints check applies to Tier-B (style/convention tier)
+    skill_results = []
+
+    # print_statement_check: Tier-B and above (all tiers)
+    try:
+        result = print_statement_check.invoke({"code_diff": diff_text})
+        if result:
+            logger.info("[Skill] print_statement_check found issues.")
+            skill_results.append(result)
+    except Exception as e:
+        logger.warning(f"Skill print_statement_check failed: {e}")
+
+    # hardcoded_secrets_check: all tiers (security-critical)
+    try:
+        result = hardcoded_secrets_check.invoke({"code_diff": diff_text})
+        if result:
+            logger.info("[Skill] hardcoded_secrets_check found issues.")
+            skill_results.append(result)
+    except Exception as e:
+        logger.warning(f"Skill hardcoded_secrets_check failed: {e}")
+    
+    # type_hints_check: Tier-B only (style/convention tier)
     if tier in ["Tier-B", "TIER-B", ""]:
         try:
-            skill_result = type_hints_check.invoke({"code_diff": diff_text})
-            if skill_result:
-                logger.info(f"[Skill] type_hints_check found issues.")
-                skill_findings_str = f"【静态 Skill 检查结果 - 规范问题】:\n{skill_result}\n\n"
+            result = type_hints_check.invoke({"code_diff": diff_text})
+            if result:
+                logger.info("[Skill] type_hints_check found issues.")
+                skill_results.append(result)
         except Exception as e:
             logger.warning(f"Skill type_hints_check failed: {e}")
+
+    if skill_results:
+        skill_findings_str = f"【静态 Skill 检查结果】:\n" + "\n".join(skill_results) + "\n\n"
     
     # Base requirements
     tier_requirements = ""

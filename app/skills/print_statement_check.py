@@ -1,0 +1,26 @@
+import re
+import logging
+from langchain_core.tools import tool
+
+logger = logging.getLogger(__name__)
+
+@tool
+def print_statement_check(code_diff: str) -> str:
+    """
+    检查代码变更中是否存在不该出现在生产代码中的 print() 调用。
+    当需要对代码做规范审查时调用此工具。
+    返回包含 print 语句的行号与内容，若无则返回空字符串。
+    """
+    logger.info("[Skill] print_statement_check triggered.")
+    
+    issues = []
+    for i, line in enumerate(code_diff.splitlines(), 1):
+        # Only check added lines in the diff (starts with +)
+        if not line.startswith('+') or line.startswith('+++'):
+            continue
+        stripped = line[1:].strip()
+        # Match print(...) calls, not inside comments or strings
+        if re.search(r'\bprint\s*\(', stripped) and not stripped.startswith('#'):
+            issues.append(f"第 {i} 行（Diff）存在 `print()` 调用，生产代码中应使用 `logging` 替代: `{stripped[:80]}`")
+    
+    return "\n".join(issues)
