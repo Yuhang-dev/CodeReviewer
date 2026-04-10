@@ -53,6 +53,56 @@ async def fetch_pr_head_commit(repo_full_name: str, pr_number: int) -> str:
         response.raise_for_status()
         pr_data = response.json()
         return pr_data["head"]["sha"]
+
+async def fetch_pr_files_data(repo_full_name: str, pr_number: int, commit_id: str) -> list[dict]:
+    """
+    Fetches the patch diff and full context for each file modified in the PR.
+    Returns a list of dictionaries with keys: filename, status, patch, full_content.
+    """
+    logger.info(f"Fetching structured PR file data for {repo_full_name}#{pr_number}...")
+    result_files = []
+    
+    async with await get_github_client() as client:
+        response = await client.get(
+            f"/repos/{repo_full_name}/pulls/{pr_number}/files"
+        )
+        if response.status_code >= 400:
+            logger.error(f"Failed to fetch PR files: {response.text}")
+            return []
+            
+        files_data = response.json()
+        
+        for file_info in files_data:
+            filename = file_info.get("filename")
+            status = file_info.get("status")
+            patch = file_info.get("patch", "")
+            
+            file_data = {
+                "filename": filename,
+                "status": status,
+                "patch": patch,
+                "full_content": ""
+            }
+            
+            # Skip removed files as we don't need their full current content
+            if status != "removed":
+                file_resp = await client.get(
+                    f"/repos/{repo_full_name}/contents/{filename}?ref={commit_id}",
+                    headers={"Accept": "application/vnd.github.v3.raw"}
+                )
+                
+                if file_resp.status_code == 200:
+                    content = file_resp.text
+                    lines = content.split('\n')
+                    if len(lines) > 2000:
+                        content = "\n".join(lines[:2000]) + "\n... (Content truncated due to length > 2000 lines)"
+                    file_data["full_content"] = content
+                else:
+                    logger.warning(f"Could not fetch full content for {filename}: {file_resp.status_code}")
+                    
+            result_files.append(file_data)
+                
+    return result_files
 async def post_pr_comment(repo_full_name: str, pr_number: int, comment_body: str):
     """
     Posts a general issue comment to the PR.
