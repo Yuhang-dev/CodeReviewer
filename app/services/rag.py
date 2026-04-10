@@ -27,6 +27,10 @@ class AgentState(TypedDict):
     chat_query: str
     chat_response: str
 
+def save_user(name, age, email):  # ← 没有 Type Hints
+    pass
+
+
 def init_qdrant() -> QdrantClient:
     """Initialize connection to Qdrant vector database."""
     client = QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY)
