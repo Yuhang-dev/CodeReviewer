@@ -9,6 +9,16 @@ from qdrant_client.models import Distance, VectorParams
 from typing import TypedDict, Annotated
 from app.core.config import settings
 
+import requests
+
+API_KEY = "sk-abc123supersecrettoken"
+
+def fetch_data(url, limit):
+    data = requests.get(url).json()
+    print(f"Got {len(data)} records")
+    return data
+
+
 logger = logging.getLogger(__name__)
 
 COLLECTION_NAME = "code_guidelines"
