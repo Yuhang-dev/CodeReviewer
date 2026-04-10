@@ -13,6 +13,10 @@ logger = logging.getLogger(__name__)
 
 COLLECTION_NAME = "code_guidelines"
 
+# Load pluggable skills
+from app.skills.type_hints_check import type_hints_check
+AVAILABLE_SKILLS = [type_hints_check]
+
 class AgentState(TypedDict):
     diff_text: str
     full_files_context: str
@@ -118,12 +122,25 @@ def review_code_step(state: AgentState):
     tier = state.get("tier", "Tier-B")
     review_context = state.get("review_context", "")
     review_focus = state.get("review_focus", "")
+    diff_text = state['diff_text']
     
     if tier == "TIER-C":
         logger.info("Tier-C detected. Skipping LLM code review (auto LGTM).")
         return {"review_result": "[]"}
         
     logger.info(f"Invoking LLM for {tier}...")
+    
+    # --- Run applicable Skills pre-LLM ---
+    skill_findings_str = ""
+    # Type hints check applies to Tier-B (style/convention tier)
+    if tier in ["Tier-B", "TIER-B", ""]:
+        try:
+            skill_result = type_hints_check.invoke({"code_diff": diff_text})
+            if skill_result:
+                logger.info(f"[Skill] type_hints_check found issues.")
+                skill_findings_str = f"【静态 Skill 检查结果 - 规范问题】:\n{skill_result}\n\n"
+        except Exception as e:
+            logger.warning(f"Skill type_hints_check failed: {e}")
     
     # Base requirements
     tier_requirements = ""
@@ -149,6 +166,7 @@ def review_code_step(state: AgentState):
             f'   [{{\"file\": \"path/to/file.py\", \"line\": 15, \"comment\": \"你的具体批注\"}}]\n\n'
             f"5. 务必确保 JSON 格式合法（用双引号包裹键名）。\n\n"
             f"{context_str}"
+            f"{skill_findings_str}"
             f"{user_focus_str}"
             f"【完整文件上下文 (仅供参考)】:\n{state.get('full_files_context', '')}\n\n"
             f"【代码 Diff 变更】:\n{state['diff_text']}\n\n"
