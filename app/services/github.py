@@ -120,6 +120,22 @@ async def post_pr_comment(repo_full_name: str, pr_number: int, comment_body: str
         response.raise_for_status()
         logger.info(f"Comment successfully posted. URL: {response.json().get('html_url')}")
 
+async def post_pr_review_reply(repo_full_name: str, pr_number: int, comment_id: int, reply_body: str):
+    """
+    Replies directly inline to a specific review comment thread.
+    """
+    logger.info(f"Replying to review comment {comment_id} in {repo_full_name}#{pr_number}...")
+    
+    async with await get_github_client() as client:
+        response = await client.post(
+            f"/repos/{repo_full_name}/pulls/{pr_number}/comments/{comment_id}/replies",
+            json={"body": reply_body}
+        )
+        if response.status_code >= 400:
+            logger.error(f"GitHub API inline reply POST Error [{response.status_code}]: {response.text}")
+        response.raise_for_status()
+        logger.info(f"Inline reply successfully posted.")
+
 async def fetch_issue_comments(repo_full_name: str, pr_number: int) -> list[str]:
     """
     Fetches the history of issue comments for a PR to provide chat context.
