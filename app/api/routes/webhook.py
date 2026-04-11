@@ -3,7 +3,7 @@ import hashlib
 import logging
 from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
 from app.core.config import settings
-from app.services.github import post_pr_comment, fetch_pr_head_commit, post_pr_review, fetch_pr_files_data, fetch_pr_diff
+from app.services.github import post_pr_comment, fetch_pr_head_commit, post_pr_review, fetch_pr_files_data, fetch_pr_diff, post_pr_review_reply
 from app.services.rag import trigger_review_pipeline
 import json
 
@@ -163,6 +163,9 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
                 
             is_refiner_trigger = "[误报]" in comment_body or "[misjudge]" in comment_body.lower()
             is_chat_trigger = "@ai" in comment_body.lower() or "@bot" in comment_body.lower()
+            
+            # The id of the comment we are replying to
+            comment_id = payload.get("comment", {}).get("id")
 
             if is_refiner_trigger:
                 logger.info(f"Processing Refiner feedback for {repo_full_name}#{pr_number}")
@@ -175,7 +178,10 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
                         
                         # run refiner pipeline
                         reply = trigger_refiner_pipeline(diff_text, comment_body)
-                        await post_pr_comment(repo_full_name, pr_number, reply)
+                        if event_type == "pull_request_review_comment" and comment_id:
+                            await post_pr_review_reply(repo_full_name, pr_number, comment_id, reply)
+                        else:
+                            await post_pr_comment(repo_full_name, pr_number, reply)
                     except Exception as e:
                         logger.error(f"Error executing refiner pipeline: {e}")
                 
@@ -190,7 +196,10 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
                         from app.services.rag import trigger_chat_pipeline
                         diff_text = await fetch_pr_diff(repo_full_name, pr_number)
                         chat_reply = trigger_chat_pipeline(diff_text, comment_body)
-                        await post_pr_comment(repo_full_name, pr_number, chat_reply)
+                        if event_type == "pull_request_review_comment" and comment_id:
+                            await post_pr_review_reply(repo_full_name, pr_number, comment_id, chat_reply)
+                        else:
+                            await post_pr_comment(repo_full_name, pr_number, chat_reply)
                     except Exception as e:
                         logger.error(f"Error executing chat pipeline: {e}")
                 
