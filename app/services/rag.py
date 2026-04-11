@@ -17,6 +17,7 @@ COLLECTION_NAME = "code_guidelines"
 from app.skills.type_hints_check import type_hints_check
 from app.skills.print_statement_check import print_statement_check
 from app.skills.hardcoded_secrets_check import hardcoded_secrets_check
+from app.skills.diff_utils import annotate_diff_with_line_numbers
 AVAILABLE_SKILLS = [type_hints_check, print_statement_check, hardcoded_secrets_check]
 
 class AgentState(TypedDict):
@@ -190,13 +191,14 @@ def review_code_step(state: AgentState):
             f"3. 如果没有问题发空数组 []。\n"
             f"4. 你的输出【必须】是严谨的 JSON 数组结构，不能包含多余的 Markdown 格式，例如：\n"
             f'   [{{\"file\": \"path/to/file.py\", \"line\": 15, \"comment\": \"你的具体批注\"}}]\n\n'
-            f"5. 务必确保 JSON 格式合法（用双引号包裹键名）。\n\n"
+            f"5. 务必确保 JSON 格式合法（用双引号包裹键名）。\n"
+            f"6. 【关键】Diff 中每行以 L+数字 开头（如 L15），这是新文件中的真实行号。你输出的 line 字段必须使用该数字，不要自己推算行号！\n\n"
             f"{context_str}"
             f"{skill_findings_str}"
             f"{user_focus_str}"
             f"【正在审查的文件】: {state.get('filename', '未知文件')}\n\n"
-            f"【完整文件上下文 (仅供参考，行号从第1行开始)】:\n{state.get('full_files_context', '')}\n\n"
-            f"【代码 Diff 变更 (line numbers match the new file)】:\n{state['diff_text']}\n\n"
+            f"【完整文件上下文 (仅供参考)】:\n{state.get('full_files_context', '')}\n\n"
+            f"【代码 Diff 变更 (L开头的数字是真实行号，直接用于 line 字段)】:\n{annotate_diff_with_line_numbers(state['diff_text'])}\n\n"
             f"精简 JSON 审查意见:"
         )
         response = llm.invoke([HumanMessage(content=prompt)])
