@@ -153,6 +153,7 @@ async def post_pr_review(repo_full_name: str, pr_number: int, commit_id: str, re
             {
                 "path": c.get("file", c.get("path", "")),
                 "line": int(c.get("line")),
+                "side": "RIGHT",  # Explicitly use new-file line numbers
                 "body": c.get("comment", c.get("body", ""))
             }
             for c in review_comments

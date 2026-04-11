@@ -21,6 +21,7 @@ AVAILABLE_SKILLS = [type_hints_check, print_statement_check, hardcoded_secrets_c
 
 class AgentState(TypedDict):
     diff_text: str
+    filename: str
     full_files_context: str
     tier: str
     review_context: str
@@ -193,8 +194,9 @@ def review_code_step(state: AgentState):
             f"{context_str}"
             f"{skill_findings_str}"
             f"{user_focus_str}"
-            f"【完整文件上下文 (仅供参考)】:\n{state.get('full_files_context', '')}\n\n"
-            f"【代码 Diff 变更】:\n{state['diff_text']}\n\n"
+            f"【正在审查的文件】: {state.get('filename', '未知文件')}\n\n"
+            f"【完整文件上下文 (仅供参考，行号从第1行开始)】:\n{state.get('full_files_context', '')}\n\n"
+            f"【代码 Diff 变更 (line numbers match the new file)】:\n{state['diff_text']}\n\n"
             f"精简 JSON 审查意见:"
         )
         response = llm.invoke([HumanMessage(content=prompt)])
@@ -263,8 +265,10 @@ def trigger_review_pipeline(pr_files_data: list[dict], tier: str = "Tier-B", rev
     for file_data in pr_files_data:
         combined_diffs += f"\nFile: {file_data['filename']}\n{file_data['patch']}\n"
         state = {
-            "diff_text": f"File: {file_data['filename']}\n{file_data['patch']}", 
-            "full_files_context": f"File: {file_data['filename']}\n{file_data['full_content']}",
+            # Pass raw patch WITHOUT "File:" prefix so Skills compute correct line numbers
+            "diff_text": file_data["patch"],
+            "filename": file_data["filename"],
+            "full_files_context": file_data["full_content"],
             "tier": tier,
             "review_context": review_context,
             "review_focus": review_focus,
