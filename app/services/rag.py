@@ -13,6 +13,16 @@ logger = logging.getLogger(__name__)
 
 COLLECTION_NAME = "code_guidelines"
 
+import requests
+
+API_KEY = "sk-abc123supersecrettoken"   # ← 触发 hardcoded_secrets_check
+
+def fetch_data(url, limit):              # ← 触发 type_hints_check
+    data = requests.get(url).json()
+    print(f"Got {len(data)} records")   # ← 触发 print_statement_check
+    return data
+
+
 # Load pluggable skills
 from app.skills.type_hints_check import type_hints_check
 from app.skills.print_statement_check import print_statement_check
