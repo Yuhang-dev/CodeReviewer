@@ -1,7 +1,6 @@
 import re
 import logging
 from langchain_core.tools import tool
-from app.skills.diff_utils import parse_diff_line_map
 
 logger = logging.getLogger(__name__)
 
@@ -37,14 +36,12 @@ def hardcoded_secrets_check(code_diff: str) -> str:
     """
     logger.info("[Skill] hardcoded_secrets_check triggered.")
     
-    line_map = parse_diff_line_map(code_diff)
     issues = []
-
-    for diff_idx, raw_line in enumerate(code_diff.splitlines(), start=1):
+    for i, line in enumerate(code_diff.splitlines(), 1):
         # Only check added lines in the diff
-        if not raw_line.startswith('+') or raw_line.startswith('+++'):
+        if not line.startswith('+') or line.startswith('+++'):
             continue
-        stripped = raw_line[1:].strip()
+        stripped = line[1:].strip()
         # Skip comments
         if stripped.startswith('#') or stripped.startswith('//'):
             continue
@@ -58,9 +55,8 @@ def hardcoded_secrets_check(code_diff: str) -> str:
                 if not is_safe:
                     # Redact the actual secret value for safety
                     redacted = re.sub(r'["\'][^"\']{4,}["\']', '"<REDACTED>"', matched_val)
-                    actual_line = line_map.get(diff_idx, diff_idx)
                     issues.append(
-                        f"第 {actual_line} 行疑似存在【{label}】硬编码: `{redacted}` — 请改用环境变量或配置中心！"
+                        f"第 {i} 行（Diff）疑似存在【{label}】硬编码: `{redacted}` — 请改用环境变量或配置中心！"
                     )
                 break  # Only report once per line
     
