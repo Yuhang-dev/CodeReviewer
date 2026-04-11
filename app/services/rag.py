@@ -95,23 +95,52 @@ def ingest_knowledge(content: str, metadata: dict = None) -> int:
     return len(chunks)
 
 
-def retrieve_guidelines(query_text: str) -> str:
+def retrieve_guidelines(query_text: str, filename: str = "") -> tuple[str, list[str]]:
     """
-    Search Qdrant for relevant coding standards.
+    Search Qdrant for relevant coding standards and staging patches.
+    Returns: (formatted guidelines string, list of disabled skill names)
     """
     try:
         query_vector = embeddings_model.embed_query(query_text)
         search_result = qdrant_client.query_points(
             collection_name=COLLECTION_NAME,
             query=query_vector,
-            limit=3
+            limit=5
         ).points
-        # Extract text from matched payloads
-        guidelines = [hit.payload.get("content", "") for hit in search_result]
-        return "\n\n".join(guidelines)
+        
+        guidelines = []
+        disabled_skills = []
+        import re
+        
+        for hit in search_result:
+            content = hit.payload.get("content", "")
+            metadata = hit.payload.get("metadata", {})
+            
+            # Metadata-driven Action Routine
+            if metadata.get("type") == "staging_patch":
+                path_regex = metadata.get("path_regex", ".*")
+                if filename and not re.search(path_regex, filename):
+                    # Hard filtering: if the staging patch scope doesn't match the current file, skip it completely
+                    logger.info(f"Filtered out staging patch due to path mismatch: {path_regex} for {filename}")
+                    continue
+                
+                # If matched, apply the patch text
+                guidelines.append(f"【自愈纠偏补丁】: {content}")
+                
+                # Suppress the skill via Route Action
+                action = metadata.get("rule_action", {}).get("action")
+                skill_name = metadata.get("rule_action", {}).get("skill_name")
+                if action == "DISABLE_SKILL" and skill_name:
+                    disabled_skills.append(skill_name)
+                    logger.info(f"Metadata routing payload triggered: Disabling skill [{skill_name}] for {filename}")
+            else:
+                # Ordinary enterprise guidelines
+                guidelines.append(content)
+                
+        return "\n\n".join(guidelines), disabled_skills
     except Exception as e:
         logger.error(f"Vector search failed: {e}")
-        return ""
+        return "", []
 
 
 def review_code_step(state: AgentState):
@@ -119,7 +148,8 @@ def review_code_step(state: AgentState):
     logger.info("Executing review_code_step. Retrieving knowledge...")
     
     # 1. Retrieve Knowledge
-    retrieved_context = retrieve_guidelines(state['diff_text'])
+    filename = state.get("filename", "")
+    retrieved_context, disabled_skills = retrieve_guidelines(state['diff_text'], filename)
     
     context_str = ""
     if retrieved_context.strip():
@@ -141,25 +171,27 @@ def review_code_step(state: AgentState):
     skill_results = []
 
     # print_statement_check: Tier-B and above (all tiers)
-    try:
-        result = print_statement_check.invoke({"code_diff": diff_text})
-        if result:
-            logger.info("[Skill] print_statement_check found issues.")
-            skill_results.append(result)
-    except Exception as e:
-        logger.warning(f"Skill print_statement_check failed: {e}")
+    if "print_statement_check" not in disabled_skills:
+        try:
+            result = print_statement_check.invoke({"code_diff": diff_text})
+            if result:
+                logger.info("[Skill] print_statement_check found issues.")
+                skill_results.append(result)
+        except Exception as e:
+            logger.warning(f"Skill print_statement_check failed: {e}")
 
-    # hardcoded_secrets_check: all tiers (security-critical)
-    try:
-        result = hardcoded_secrets_check.invoke({"code_diff": diff_text})
-        if result:
-            logger.info("[Skill] hardcoded_secrets_check found issues.")
-            skill_results.append(result)
-    except Exception as e:
-        logger.warning(f"Skill hardcoded_secrets_check failed: {e}")
+    # hardcoded_secrets_check: all tiers
+    if "hardcoded_secrets_check" not in disabled_skills:
+        try:
+            result = hardcoded_secrets_check.invoke({"code_diff": diff_text})
+            if result:
+                logger.info("[Skill] hardcoded_secrets_check found issues.")
+                skill_results.append(result)
+        except Exception as e:
+            logger.warning(f"Skill hardcoded_secrets_check failed: {e}")
     
-    # type_hints_check: Tier-B only (style/convention tier)
-    if tier in ["Tier-B", "TIER-B", ""]:
+    # type_hints_check: Tier-B only
+    if tier in ["Tier-B", "TIER-B", ""] and "type_hints_check" not in disabled_skills:
         try:
             result = type_hints_check.invoke({"code_diff": diff_text})
             if result:
@@ -175,28 +207,30 @@ def review_code_step(state: AgentState):
     semantic_skill_results = []
     if tier in ["Tier-A", "TIER-A", "Tier-S", "TIER-S"]:
         # idempotency_check
-        try:
-            result = idempotency_check.invoke({
-                "code_diff": diff_text, 
-                "full_content": state.get('full_files_context', '')
-            })
-            if result:
-                logger.info("[Skill] idempotency_check found issues.")
-                semantic_skill_results.append(result)
-        except Exception as e:
-            logger.warning(f"Skill idempotency_check failed: {e}")
+        if "idempotency_check" not in disabled_skills:
+            try:
+                result = idempotency_check.invoke({
+                    "code_diff": diff_text, 
+                    "full_content": state.get('full_files_context', '')
+                })
+                if result:
+                    logger.info("[Skill] idempotency_check found issues.")
+                    semantic_skill_results.append(result)
+            except Exception as e:
+                logger.warning(f"Skill idempotency_check failed: {e}")
             
         # api_resilience_check
-        try:
-            result = api_resilience_check.invoke({
-                "code_diff": diff_text, 
-                "full_content": state.get('full_files_context', '')
-            })
-            if result:
-                logger.info("[Skill] api_resilience_check found issues.")
-                semantic_skill_results.append(result)
-        except Exception as e:
-            logger.warning(f"Skill api_resilience_check failed: {e}")
+        if "api_resilience_check" not in disabled_skills:
+            try:
+                result = api_resilience_check.invoke({
+                    "code_diff": diff_text, 
+                    "full_content": state.get('full_files_context', '')
+                })
+                if result:
+                    logger.info("[Skill] api_resilience_check found issues.")
+                    semantic_skill_results.append(result)
+            except Exception as e:
+                logger.warning(f"Skill api_resilience_check failed: {e}")
             
     if semantic_skill_results:
         skill_findings_str += f"【Agentic Skill 深度分析报告】:\n" + "\n".join(semantic_skill_results) + "\n\n"
@@ -370,3 +404,70 @@ def build_chat_graph() -> StateGraph:
     return workflow.compile()
 
 chat_graph = build_chat_graph()
+
+def trigger_chat_pipeline(diff_text: str, chat_query: str) -> str:
+    state = {
+        "diff_text": diff_text,
+        "filename": "",
+        "full_files_context": "",
+        "tier": "",
+        "review_context": "",
+        "review_focus": "",
+        "review_result": "",
+        "chat_query": chat_query,
+        "chat_response": ""
+    }
+    result = chat_graph.invoke(state)
+    return result.get("chat_response", "无法生成回答。")
+
+def trigger_refiner_pipeline(diff_text: str, user_comment: str) -> str:
+    """
+    Acts as the Refiner Agent. Takes the PR diff and user's rebuttal,
+    synthesizes a structured JSON insight, and saves it to Qdrant as a staging patch.
+    """
+    logger.info("Triggering Refiner Agent...")
+    llm = init_llm()
+    prompt = (
+        f"你是一名架构规范总结师（Refiner Agent）。\n"
+        f"背景：一位开发者在你的代码评审留下了反驳意见。如果是你之前的误报（False Positive），\n"
+        f"请提取这背后的业务领域知识，并输出一段具有强上下文的架构认知更新。\n"
+        f"【严格禁止】：绝对禁止输出“不再检查 xxx”等粗暴的屏蔽性规则！\n\n"
+        f"【要求输出格式】：纯净的 JSON 格式，不要任何 Markdown 标记。必须包含：\n"
+        f"1. insight_text (针对业务逻辑的认知更新)\n"
+        f"2. rule_action (强硬路由控制，包含 action='DISABLE_SKILL', skill_name, path_regex)\n\n"
+        f"【原始 Diff】:\n{diff_text}\n\n"
+        f"【开发者反驳】:\n{user_comment}\n\n"
+        f"请输出 JSON:"
+    )
+    
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        raw_text = response.content.strip()
+        import re, json
+        # Extract json safely
+        json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if json_match:
+            try:
+                parsed_json = json.loads(json_match.group(0))
+                # Persist to Qdrant staging area
+                metadata = {
+                    "source": "Self-Reflection Loop",
+                    "type": "staging_patch",
+                    "path_regex": parsed_json.get("rule_action", {}).get("path_regex", ".*"),
+                    "rule_action": parsed_json.get("rule_action", {})
+                }
+                content_to_save = parsed_json.get("insight_text", "")
+                
+                # Ingest to Qdrant
+                from app.services.rag import ingest_knowledge
+                ingest_knowledge(content_to_save, metadata=metadata)
+                
+                rule_name = parsed_json.get("rule_action", {}).get("skill_name", "UNKNOWN")
+                return f"✅ **收到反馈，自愈机制已启动！**\n\n我已经将您的上下文提炼为新的架构认知，并记录进短期记忆池 (Staging DB)。\n下次审查命中相同路径的 PR 时，针对 `{rule_name}` 的检查将被拦截或软化。\n\n> 提炼的认知: *{content_to_save}*"
+            except Exception as e:
+                logger.error(f"Failed to parse Refiner json: {e}")
+                return "❌ 无法解析反馈认知，自愈闭环失败。"
+        return "❌ 无法生成规范资产。"
+    except Exception as e:
+        logger.error(f"LLM API Error during Refiner: {e}")
+        return f"❌ 内部反思特工执行错误: {str(e)}"

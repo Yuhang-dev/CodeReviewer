@@ -142,32 +142,53 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
             background_tasks.add_task(background_job)
             return {"status": "accepted", "message": "Code review pipeline triggered"}
             
-    elif event_type == "issue_comment":
+    elif event_type in ["issue_comment", "pull_request_review_comment"]:
         action = payload.get("action")
         if action == "created":
             sender = payload.get("sender", {}).get("login", "")
             if "bot" in sender.lower() or sender == "github-actions[bot]":
                 return {"status": "ignored", "message": "Ignored bot comment."}
 
-            # Only process comments on PRs
-            if "pull_request" not in payload.get("issue", {}):
+            if event_type == "issue_comment" and "pull_request" not in payload.get("issue", {}):
                 return {"status": "ignored", "message": "Not a pull request comment."}
 
             comment_body = payload.get("comment", {}).get("body", "")
-            # Only trigger if the user mentions "@ai" or "@bot"
-            if "@ai" in comment_body.lower() or "@bot" in comment_body.lower():
-                repo_full_name = payload["repository"]["full_name"]
+            repo_full_name = payload["repository"]["full_name"]
+            
+            # Extract PR number depending on event type
+            if event_type == "issue_comment":
                 pr_number = payload["issue"]["number"]
+            else:
+                pr_number = payload["pull_request"]["number"]
+                
+            is_refiner_trigger = "[误报]" in comment_body or "[misjudge]" in comment_body.lower()
+            is_chat_trigger = "@ai" in comment_body.lower() or "@bot" in comment_body.lower()
+
+            if is_refiner_trigger:
+                logger.info(f"Processing Refiner feedback for {repo_full_name}#{pr_number}")
+                
+                async def background_refiner_job():
+                    try:
+                        from app.services.rag import trigger_refiner_pipeline
+                        # Fetch diff context
+                        diff_text = await fetch_pr_diff(repo_full_name, pr_number)
+                        
+                        # run refiner pipeline
+                        reply = trigger_refiner_pipeline(diff_text, comment_body)
+                        await post_pr_comment(repo_full_name, pr_number, reply)
+                    except Exception as e:
+                        logger.error(f"Error executing refiner pipeline: {e}")
+                
+                background_tasks.add_task(background_refiner_job)
+                return {"status": "accepted", "message": "Refiner pipeline triggered"}
+                
+            elif is_chat_trigger:
                 logger.info(f"Processing chat comment for {repo_full_name}#{pr_number}")
 
                 async def background_chat_job():
                     try:
                         from app.services.rag import trigger_chat_pipeline
-                        # Fetch diff context
                         diff_text = await fetch_pr_diff(repo_full_name, pr_number)
-                        # TODO: Fetch chat history from GitHub
-                        
-                        # run chat pipeline
                         chat_reply = trigger_chat_pipeline(diff_text, comment_body)
                         await post_pr_comment(repo_full_name, pr_number, chat_reply)
                     except Exception as e:
