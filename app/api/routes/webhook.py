@@ -3,7 +3,7 @@ import hashlib
 import logging
 from fastapi import APIRouter, Request, HTTPException, BackgroundTasks
 from app.core.config import settings
-from app.services.github import post_pr_comment, fetch_pr_head_commit, post_pr_review, fetch_pr_files_data
+from app.services.github import post_pr_comment, fetch_pr_head_commit, post_pr_review, fetch_pr_files_data, fetch_pr_diff
 from app.services.rag import trigger_review_pipeline
 import json
 
