@@ -18,7 +18,16 @@ from app.skills.type_hints_check import type_hints_check
 from app.skills.print_statement_check import print_statement_check
 from app.skills.hardcoded_secrets_check import hardcoded_secrets_check
 from app.skills.diff_utils import annotate_diff_with_line_numbers
-AVAILABLE_SKILLS = [type_hints_check, print_statement_check, hardcoded_secrets_check]
+from app.skills.idempotency_check import idempotency_check
+from app.skills.api_resilience_check import api_resilience_check
+
+AVAILABLE_SKILLS = [
+    type_hints_check, 
+    print_statement_check, 
+    hardcoded_secrets_check,
+    idempotency_check,
+    api_resilience_check
+]
 
 class AgentState(TypedDict):
     diff_text: str
@@ -50,14 +59,7 @@ qdrant_client = init_qdrant()
 embeddings_model = HuggingFaceEmbeddings(model_name="BAAI/bge-small-zh-v1.5")
 
 
-def init_llm() -> ChatOpenAI:
-    return ChatOpenAI(
-        api_key=settings.DEEPSEEK_API_KEY, 
-        base_url=settings.DEEPSEEK_BASE_URL,
-        model="deepseek-chat"
-    )
-
-
+from app.core.llm import init_llm
 def ingest_knowledge(content: str, metadata: dict = None) -> int:
     """
     Chunks the input markdown text, generates embeddings, and saves to Qdrant.
@@ -168,6 +170,36 @@ def review_code_step(state: AgentState):
 
     if skill_results:
         skill_findings_str = f"【静态 Skill 检查结果】:\n" + "\n".join(skill_results) + "\n\n"
+        
+    # --- Run LLM-backed Semantic Skills (Tier-A/S only) ---
+    semantic_skill_results = []
+    if tier in ["Tier-A", "TIER-A", "Tier-S", "TIER-S"]:
+        # idempotency_check
+        try:
+            result = idempotency_check.invoke({
+                "code_diff": diff_text, 
+                "full_content": state.get('full_files_context', '')
+            })
+            if result:
+                logger.info("[Skill] idempotency_check found issues.")
+                semantic_skill_results.append(result)
+        except Exception as e:
+            logger.warning(f"Skill idempotency_check failed: {e}")
+            
+        # api_resilience_check
+        try:
+            result = api_resilience_check.invoke({
+                "code_diff": diff_text, 
+                "full_content": state.get('full_files_context', '')
+            })
+            if result:
+                logger.info("[Skill] api_resilience_check found issues.")
+                semantic_skill_results.append(result)
+        except Exception as e:
+            logger.warning(f"Skill api_resilience_check failed: {e}")
+            
+    if semantic_skill_results:
+        skill_findings_str += f"【Agentic Skill 深度分析报告】:\n" + "\n".join(semantic_skill_results) + "\n\n"
     
     # Base requirements
     tier_requirements = ""
