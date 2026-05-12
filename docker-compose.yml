@@ -10,12 +10,13 @@ services:
       - "8000:8000"
     volumes:
       - .:/app
+      - ~/.cache/huggingface:/root/.cache/huggingface
     environment:
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - QDRANT_URL=http://qdrant:6333
-      - HF_ENDPOINT=https://hf-mirror.com
+      - HF_HUB_OFFLINE=1
     env_file:
       - .env
     depends_on:
@@ -29,12 +30,13 @@ services:
     command: celery -A app.worker.celery_app worker --loglevel=info
     volumes:
       - .:/app
+      - ~/.cache/huggingface:/root/.cache/huggingface
     environment:
       - REDIS_URL=redis://redis:6379/0
       - CELERY_BROKER_URL=redis://redis:6379/0
       - CELERY_RESULT_BACKEND=redis://redis:6379/0
       - QDRANT_URL=http://qdrant:6333
-      - HF_ENDPOINT=https://hf-mirror.com
+      - HF_HUB_OFFLINE=1
     env_file:
       - .env
     depends_on:
