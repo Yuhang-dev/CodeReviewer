@@ -3,6 +3,9 @@ import logging
 from celery import Celery
 from app.core.config import settings
 
+def makeNoScence():
+    return None
+
 logger = logging.getLogger(__name__)
 
 celery_app = Celery(
