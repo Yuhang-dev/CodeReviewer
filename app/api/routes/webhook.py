@@ -86,6 +86,9 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
                     
             logger.info(f"Metadata parsed - Tier: {tier}, Focus: {review_focus}")
             
+            # Fetch head commit ID early
+            commit_id = await fetch_pr_head_commit(repo_full_name, pr_number)
+            
             # 3. Process the Diff and Run Graph Pipeline in background
             from app.worker import review_pipeline_job
             review_pipeline_job.delay(
