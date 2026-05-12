@@ -87,60 +87,17 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
             logger.info(f"Metadata parsed - Tier: {tier}, Focus: {review_focus}")
             
             # 3. Process the Diff and Run Graph Pipeline in background
-            async def background_job():
-                try:
-                    # Fetch head commit ID early
-                    commit_id = await fetch_pr_head_commit(repo_full_name, pr_number)
-                    
-                    # Fetch structured files data per file
-                    pr_files_data = await fetch_pr_files_data(repo_full_name, pr_number, commit_id)
-                    
-                    # trigger_review_pipeline is synchronous
-                    result_data = trigger_review_pipeline(
-                        pr_files_data, 
-                        tier=tier,
-                        review_context=review_context,
-                        review_focus=review_focus
-                    )
-                    
-                    review_comments = result_data.get("comments", [])
-                    global_warning = result_data.get("global_warning", "")
-                    
-                    if global_warning:
-                        await post_pr_comment(repo_full_name, pr_number, f"⚠️ **Global Impact Warning ( {tier} )** ⚠️\n\n{global_warning}")
-                    
-                    inline_success = False
-                    if review_comments:
-                        # Fix path issues (remove a/ or b/ prefixes)
-                        for c in review_comments:
-                            p = c.get("file", c.get("path", ""))
-                            if p.startswith("a/") or p.startswith("b/"):
-                                c["path"] = p[2:]
-                            elif "file" in c:
-                                c["path"] = c["file"]
-                        
-                        try:
-                            await post_pr_review(repo_full_name, pr_number, commit_id, review_comments)
-                            inline_success = True
-                        except Exception as e:
-                            logger.warning(f"Failed to post inline review (fallback to general): {e}")
-                            fallback_md = "⚠️ **无法精确定位代码行，改用全局评论：**\n\n"
-                            for c in review_comments:
-                                fallback_md += f"- **{c.get('file', 'Unknown File')}** (Line {c.get('line', '?')}): {c.get('comment', '')}\n"
-                            await post_pr_comment(repo_full_name, pr_number, fallback_md)
-                            inline_success = True  # We handled the fallback
-                            
-                    if inline_success:
-                        return
-                        
-                    # If empty
-                    if not review_comments:
-                        await post_pr_comment(repo_full_name, pr_number, f"AI Code Review completed ({tier}). LGTM! 👍")
-                except Exception as e:
-                    logger.error(f"Error executing review pipeline: {e}")
-
-            background_tasks.add_task(background_job)
-            return {"status": "accepted", "message": "Code review pipeline triggered"}
+            from app.worker import review_pipeline_job
+            review_pipeline_job.delay(
+                repo_full_name, 
+                pr_number, 
+                commit_id, 
+                tier=tier, 
+                review_context=review_context, 
+                review_focus=review_focus
+            )
+            
+            return {"status": "accepted", "message": "Code review pipeline triggered via Celery"}
             
     elif event_type in ["issue_comment", "pull_request_review_comment"]:
         action = payload.get("action")
@@ -169,41 +126,14 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
 
             if is_refiner_trigger:
                 logger.info(f"Processing Refiner feedback for {repo_full_name}#{pr_number}")
-                
-                async def background_refiner_job():
-                    try:
-                        from app.services.rag import trigger_refiner_pipeline
-                        # Fetch diff context
-                        diff_text = await fetch_pr_diff(repo_full_name, pr_number)
-                        
-                        # run refiner pipeline
-                        reply = trigger_refiner_pipeline(diff_text, comment_body)
-                        if event_type == "pull_request_review_comment" and comment_id:
-                            await post_pr_review_reply(repo_full_name, pr_number, comment_id, reply)
-                        else:
-                            await post_pr_comment(repo_full_name, pr_number, reply)
-                    except Exception as e:
-                        logger.error(f"Error executing refiner pipeline: {e}")
-                
-                background_tasks.add_task(background_refiner_job)
-                return {"status": "accepted", "message": "Refiner pipeline triggered"}
+                from app.worker import refiner_pipeline_job
+                refiner_pipeline_job.delay(repo_full_name, pr_number, comment_body, event_type, comment_id)
+                return {"status": "accepted", "message": "Refiner pipeline triggered via Celery"}
                 
             elif is_chat_trigger:
                 logger.info(f"Processing chat comment for {repo_full_name}#{pr_number}")
-
-                async def background_chat_job():
-                    try:
-                        from app.services.rag import trigger_chat_pipeline
-                        diff_text = await fetch_pr_diff(repo_full_name, pr_number)
-                        chat_reply = trigger_chat_pipeline(diff_text, comment_body)
-                        if event_type == "pull_request_review_comment" and comment_id:
-                            await post_pr_review_reply(repo_full_name, pr_number, comment_id, chat_reply)
-                        else:
-                            await post_pr_comment(repo_full_name, pr_number, chat_reply)
-                    except Exception as e:
-                        logger.error(f"Error executing chat pipeline: {e}")
-                
-                background_tasks.add_task(background_chat_job)
-                return {"status": "accepted", "message": "Chat pipeline triggered"}
+                from app.worker import chat_pipeline_job
+                chat_pipeline_job.delay(repo_full_name, pr_number, comment_body, event_type, comment_id)
+                return {"status": "accepted", "message": "Chat pipeline triggered via Celery"}
 
     return {"status": "ignored", "message": "Event type or action not handled"}

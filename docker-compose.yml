@@ -1,0 +1,64 @@
+version: '3.8'
+
+services:
+  # 1. 后端 Web 接口 (FastAPI)
+  api:
+    build: .
+    container_name: code_reviewer_api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
+      - HF_ENDPOINT=https://hf-mirror.com
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - qdrant
+
+  # 2. 异步任务处理器 (Celery Worker)
+  celery_worker:
+    build: .
+    container_name: code_reviewer_worker
+    command: celery -A app.worker.celery_app worker --loglevel=info
+    volumes:
+      - .:/app
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - QDRANT_URL=http://qdrant:6333
+      - HF_ENDPOINT=https://hf-mirror.com
+    env_file:
+      - .env
+    depends_on:
+      - redis
+      - qdrant
+
+  # 3. 消息队列 (Redis)
+  redis:
+    image: redis:7-alpine
+    container_name: code_reviewer_redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+
+  # 4. 向量数据库 (Qdrant)
+  qdrant:
+    image: qdrant/qdrant
+    container_name: code_reviewer_qdrant
+    ports:
+      - "6333:6333"
+    volumes:
+      - qdrant_data:/qdrant/storage
+
+volumes:
+  redis_data:
+  qdrant_data:
