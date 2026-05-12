@@ -5,6 +5,9 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+def nonesenese():
+    return None
+
 celery_app = Celery(
     "code_reviewer_tasks",
     broker=settings.CELERY_BROKER_URL,
