@@ -16,7 +16,8 @@ async def get_github_client() -> httpx.AsyncClient:
     return httpx.AsyncClient(
         base_url="https://api.github.com",
         headers=headers,
-        timeout=30.0
+        timeout=30.0,
+        verify=False
     )
 
 
