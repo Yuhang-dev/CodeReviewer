@@ -22,4 +22,4 @@ __pycache__/
 
 # Project specifics
 *.log
-*.md
+REVIEW_FORMAT.md
