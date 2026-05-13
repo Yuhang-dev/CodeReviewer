@@ -1,0 +1,473 @@
+import logging
+from langchain_openai import ChatOpenAI
+from langchain_core.messages import HumanMessage
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from langgraph.graph import StateGraph, END
+from qdrant_client import QdrantClient
+from qdrant_client.models import Distance, VectorParams
+from typing import TypedDict, Annotated
+from app.core.config import settings
+
+logger = logging.getLogger(__name__)
+
+COLLECTION_NAME = "code_guidelines"
+
+# Load pluggable skills
+from app.skills.type_hints_check import type_hints_check
+from app.skills.print_statement_check import print_statement_check
+from app.skills.hardcoded_secrets_check import hardcoded_secrets_check
+from app.skills.diff_utils import annotate_diff_with_line_numbers
+from app.skills.idempotency_check import idempotency_check
+from app.skills.api_resilience_check import api_resilience_check
+
+AVAILABLE_SKILLS = [
+    type_hints_check, 
+    print_statement_check, 
+    hardcoded_secrets_check,
+    idempotency_check,
+    api_resilience_check
+]
+
+class AgentState(TypedDict):
+    diff_text: str
+    filename: str
+    full_files_context: str
+    tier: str
+    review_context: str
+    review_focus: str
+    review_result: str
+    chat_query: str
+    chat_response: str
+
+def init_qdrant() -> QdrantClient:
+    """Initialize connection to Qdrant vector database."""
+    client = QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY)
+    
+    # Ensure collection exists
+    if not client.collection_exists(collection_name=COLLECTION_NAME):
+        logger.info(f"Creating Qdrant collection: {COLLECTION_NAME}")
+        client.create_collection(
+            collection_name=COLLECTION_NAME,
+            vectors_config=VectorParams(size=512, distance=Distance.COSINE),
+        )
+    return client
+
+# Singleton clients
+qdrant_client = init_qdrant()
+# Fast, local, private embeddings
+embeddings_model = HuggingFaceEmbeddings(model_name="BAAI/bge-small-zh-v1.5")
+
+
+from app.core.llm import init_llm
+def ingest_knowledge(content: str, metadata: dict = None) -> int:
+    """
+    Chunks the input markdown text, generates embeddings, and saves to Qdrant.
+    """
+    logger.info("Ingesting knowledge text...")
+    
+    # Text splitting
+    text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
+    chunks = text_splitter.split_text(content)
+    
+    if not chunks:
+        return 0
+
+    # Embed and upsert
+    vectors = embeddings_model.embed_documents(chunks)
+    
+    payloads = [{"content": chunk, **(metadata or {})} for chunk in chunks]
+    ids = list(range(len(chunks))) # In real app, use UUIDs
+    
+    # For MVP we just use sequential IDs. Existing IDs will be overwritten or we can use UUIDs:
+    import uuid
+    ids = [str(uuid.uuid4()) for _ in chunks]
+
+    qdrant_client.upsert(
+        collection_name=COLLECTION_NAME,
+        points=[
+            {"id": id_, "vector": vector, "payload": payload}
+            for id_, vector, payload in zip(ids, vectors, payloads)
+        ],
+    )
+    
+    logger.info(f"Ingested {len(chunks)} chunks successfully.")
+    return len(chunks)
+
+
+def retrieve_guidelines(query_text: str, filename: str = "") -> tuple[str, list[str]]:
+    """
+    Search Qdrant for relevant coding standards and staging patches.
+    Returns: (formatted guidelines string, list of disabled skill names)
+    """
+    try:
+        query_vector = embeddings_model.embed_query(query_text)
+        search_result = qdrant_client.query_points(
+            collection_name=COLLECTION_NAME,
+            query=query_vector,
+            limit=5
+        ).points
+        
+        guidelines = []
+        disabled_skills = []
+        import re
+        
+        for hit in search_result:
+            content = hit.payload.get("content", "")
+            metadata = hit.payload.get("metadata", {})
+            
+            # Metadata-driven Action Routine
+            if metadata.get("type") == "staging_patch":
+                path_regex = metadata.get("path_regex", ".*")
+                if filename and not re.search(path_regex, filename):
+                    # Hard filtering: if the staging patch scope doesn't match the current file, skip it completely
+                    logger.info(f"Filtered out staging patch due to path mismatch: {path_regex} for {filename}")
+                    continue
+                
+                # If matched, apply the patch text
+                guidelines.append(f"【自愈纠偏补丁】: {content}")
+                
+                # Suppress the skill via Route Action
+                action = metadata.get("rule_action", {}).get("action")
+                skill_name = metadata.get("rule_action", {}).get("skill_name")
+                if action == "DISABLE_SKILL" and skill_name:
+                    disabled_skills.append(skill_name)
+                    logger.info(f"Metadata routing payload triggered: Disabling skill [{skill_name}] for {filename}")
+            else:
+                # Ordinary enterprise guidelines
+                guidelines.append(content)
+                
+        return "\n\n".join(guidelines), disabled_skills
+    except Exception as e:
+        logger.error(f"Vector search failed: {e}")
+        return "", []
+
+
+def review_code_step(state: AgentState):
+    """LangGraph node: Reviews code taking constraints/RAG context into account."""
+    logger.info("Executing review_code_step. Retrieving knowledge...")
+    
+    # 1. Retrieve Knowledge
+    filename = state.get("filename", "")
+    retrieved_context, disabled_skills = retrieve_guidelines(state['diff_text'], filename)
+    
+    context_str = ""
+    if retrieved_context.strip():
+        context_str = f"【企业代码规范参考】:\n{retrieved_context}\n\n请务必检查上述代码是否可能违反了上述规范要求。\n\n"
+    
+    tier = state.get("tier", "Tier-B")
+    review_context = state.get("review_context", "")
+    review_focus = state.get("review_focus", "")
+    diff_text = state['diff_text']
+    
+    if tier == "TIER-C":
+        logger.info("Tier-C detected. Skipping LLM code review (auto LGTM).")
+        return {"review_result": "[]"}
+        
+    logger.info(f"Invoking LLM for {tier}...")
+    
+    # --- Run applicable Skills pre-LLM ---
+    skill_findings_str = ""
+    skill_results = []
+
+    # print_statement_check: Tier-B and above (all tiers)
+    if "print_statement_check" not in disabled_skills:
+        try:
+            result = print_statement_check.invoke({"code_diff": diff_text})
+            if result:
+                logger.info("[Skill] print_statement_check found issues.")
+                skill_results.append(result)
+        except Exception as e:
+            logger.warning(f"Skill print_statement_check failed: {e}")
+
+    # hardcoded_secrets_check: all tiers
+    if "hardcoded_secrets_check" not in disabled_skills:
+        try:
+            result = hardcoded_secrets_check.invoke({"code_diff": diff_text})
+            if result:
+                logger.info("[Skill] hardcoded_secrets_check found issues.")
+                skill_results.append(result)
+        except Exception as e:
+            logger.warning(f"Skill hardcoded_secrets_check failed: {e}")
+    
+    # type_hints_check: Tier-B only
+    if tier in ["Tier-B", "TIER-B", ""] and "type_hints_check" not in disabled_skills:
+        try:
+            result = type_hints_check.invoke({"code_diff": diff_text})
+            if result:
+                logger.info("[Skill] type_hints_check found issues.")
+                skill_results.append(result)
+        except Exception as e:
+            logger.warning(f"Skill type_hints_check failed: {e}")
+
+    if skill_results:
+        skill_findings_str = f"【静态 Skill 检查结果】:\n" + "\n".join(skill_results) + "\n\n"
+        
+    # --- Run LLM-backed Semantic Skills (Tier-A/S only) ---
+    semantic_skill_results = []
+    if tier in ["Tier-A", "TIER-A", "Tier-S", "TIER-S"]:
+        # idempotency_check
+        if "idempotency_check" not in disabled_skills:
+            try:
+                result = idempotency_check.invoke({
+                    "code_diff": diff_text, 
+                    "full_content": state.get('full_files_context', '')
+                })
+                if result:
+                    logger.info("[Skill] idempotency_check found issues.")
+                    semantic_skill_results.append(result)
+            except Exception as e:
+                logger.warning(f"Skill idempotency_check failed: {e}")
+            
+        # api_resilience_check
+        if "api_resilience_check" not in disabled_skills:
+            try:
+                result = api_resilience_check.invoke({
+                    "code_diff": diff_text, 
+                    "full_content": state.get('full_files_context', '')
+                })
+                if result:
+                    logger.info("[Skill] api_resilience_check found issues.")
+                    semantic_skill_results.append(result)
+            except Exception as e:
+                logger.warning(f"Skill api_resilience_check failed: {e}")
+            
+    if semantic_skill_results:
+        skill_findings_str += f"【Agentic Skill 深度分析报告】:\n" + "\n".join(semantic_skill_results) + "\n\n"
+    
+    # Base requirements
+    tier_requirements = ""
+    if tier == "TIER-S":
+        tier_requirements = "这是极核心/安全底层的代码，请【极其严苛】地审查并发状态、死锁、内存泄漏、防重放、越权和 SQL 注入等致命问题！不放过任何蛛丝马迹。"
+    elif tier == "TIER-A":
+        tier_requirements = "这是核心业务逻辑，请侧重检查异常边界条件、空指针、重试逻辑和幂等性是否有缺失。"
+    else:
+        tier_requirements = "请重点查验基础规范、Type Hints、命名和是否有明显错误即可。"
+        
+    user_focus_str = ""
+    if review_context or review_focus:
+        user_focus_str = f"【开发者说明】:\n背景: {review_context}\n焦点: {review_focus}\n\n请【务必】针对开发者的焦点(Focus)进行深度评估校验！\n\n"
+
+    llm = init_llm()
+    try:
+        prompt = (
+            f"请使用**中文**审查以下代码变更。你是一位极其干练的资深工程师，你的 Review 必须符合以下要求：\n"
+            f"1. 极度精简，只指出问题。\n"
+            f"2. {tier_requirements}\n"
+            f"3. 如果没有问题发空数组 []。\n"
+            f"4. 你的输出【必须】是严谨的 JSON 数组结构，不能包含多余的 Markdown 格式，例如：\n"
+            f'   [{{\"file\": \"path/to/file.py\", \"line\": 15, \"comment\": \"你的具体批注\"}}]\n\n'
+            f"5. 务必确保 JSON 格式合法（用双引号包裹键名）。\n"
+            f"6. 【关键】Diff 中每行以 L+数字 开头（如 L15），这是新文件中的真实行号。你输出的 line 字段必须使用该数字，不要自己推算行号！\n\n"
+            f"{context_str}"
+            f"{skill_findings_str}"
+            f"{user_focus_str}"
+            f"【正在审查的文件】: {state.get('filename', '未知文件')}\n\n"
+            f"【完整文件上下文 (仅供参考)】:\n{state.get('full_files_context', '')}\n\n"
+            f"【代码 Diff 变更 (L开头的数字是真实行号，直接用于 line 字段)】:\n{annotate_diff_with_line_numbers(state['diff_text'])}\n\n"
+            f"精简 JSON 审查意见:"
+        )
+        response = llm.invoke([HumanMessage(content=prompt)])
+        raw_text = response.content.strip()
+        
+        # Simple extraction logic for markdown wrapped json
+        import re
+        json_match = re.search(r'\[\s*\{.*?\}\s*\]', raw_text, re.DOTALL)
+        if json_match:
+            raw_text = json_match.group(0)
+        elif raw_text.startswith("```json"):
+            raw_text = raw_text[7:].strip("`\n ")
+            
+        logger.info(f"Code Review completed by LLM.")
+        return {"review_result": raw_text}
+    except Exception as e:
+        logger.error(f"LLM API Error during code review: {e}")
+        return {"review_result": "[]"}
+
+
+def build_review_graph() -> StateGraph:
+    workflow = StateGraph(AgentState)
+    workflow.add_node("review_code", review_code_step)
+    workflow.set_entry_point("review_code")
+    workflow.add_edge("review_code", END)
+    return workflow.compile()
+
+graph = build_review_graph()
+
+def global_impact_step(state: AgentState):
+    """LangGraph node: Assesses cross-file backward compatibility."""
+    logger.info("Executing global_impact_step...")
+    llm = init_llm()
+    try:
+        prompt = (
+            f"你是一位全局架构师。请仅评估以下文件的修改是否会导致**全局接口破坏**或**向后不兼容**。\n"
+            f"不需要指出具体行数代码错误，只需给出一个宏观警告。\n"
+            f"如果影响不大，返回严格的空字符串。\n"
+            f"如果有影响，请输出一段纯文本警告内容。\n\n"
+            f"【代码 Diff 变更】:\n{state['diff_text']}"
+        )
+        response = llm.invoke([HumanMessage(content=prompt)])
+        return {"review_result": response.content.strip()}
+    except Exception as e:
+        logger.error(f"Global impact error: {e}")
+        return {"review_result": ""}
+
+global_graph = StateGraph(AgentState)
+global_graph.add_node("global_impact", global_impact_step)
+global_graph.set_entry_point("global_impact")
+global_graph.add_edge("global_impact", END)
+global_impact_graph = global_graph.compile()
+
+def trigger_review_pipeline(pr_files_data: list[dict], tier: str = "Tier-B", review_context: str = "", review_focus: str = "") -> dict:
+    """
+    Executes Local Review Agents natively concurrently per-file.
+    Optionally executes Global Impact Agent if tier mandates it.
+    Returns: {"comments": list[dict], "global_warning": str}
+    """
+    logger.info(f"Triggering Multi-Agent Map-Reduce pipeline for {len(pr_files_data)} files...")
+    if not pr_files_data:
+        return {"comments": [], "global_warning": ""}
+        
+    initial_states = []
+    combined_diffs = ""
+    for file_data in pr_files_data:
+        combined_diffs += f"\nFile: {file_data['filename']}\n{file_data['patch']}\n"
+        state = {
+            # Pass raw patch WITHOUT "File:" prefix so Skills compute correct line numbers
+            "diff_text": file_data["patch"],
+            "filename": file_data["filename"],
+            "full_files_context": file_data["full_content"],
+            "tier": tier,
+            "review_context": review_context,
+            "review_focus": review_focus,
+            "review_result": "", 
+            "chat_query": "", 
+            "chat_response": ""
+        }
+        initial_states.append(state)
+        
+    # 1. Parallel execution for Local File Reviewers
+    results = graph.batch(initial_states)
+    
+    all_reviews = []
+    import json
+    for result in results:
+        res_str = result.get("review_result", "[]")
+        if res_str:
+            try:
+                parsed = json.loads(res_str)
+                if isinstance(parsed, list):
+                    all_reviews.extend(parsed)
+            except json.JSONDecodeError:
+                pass
+
+    # 2. Sequential/Parallel Global Impact Analyzer (if tier allows)
+    global_warning = ""
+    if tier in ["TIER-S", "TIER-A"]:
+        gl_state = {
+            "diff_text": combined_diffs,
+            "full_files_context": "",
+            "tier": tier,
+            "review_context": review_context,
+            "review_focus": review_focus,
+            "review_result": "", 
+            "chat_query": "", 
+            "chat_response": ""
+        }
+        res = global_impact_graph.invoke(gl_state)
+        global_warning = res.get("review_result", "")
+        
+    return {"comments": all_reviews, "global_warning": global_warning}
+
+def chat_step(state: AgentState):
+    """LangGraph node: Answers developer questions about the code/review."""
+    logger.info("Executing chat_step...")
+    llm = init_llm()
+    try:
+        prompt = (
+            f"你是一个资深 AI Code Reviewer，正在与开发者就 PR 进行对话。\n"
+            f"【PR Diff 背景】:\n{state.get('diff_text', '暂无代码')}\n\n"
+            f"【开发者的问题】:\n{state.get('chat_query')}\n\n"
+            f"请简洁专业地回答（请精简，直接切入正题，尽量提供代码示例）。"
+        )
+        response = llm.invoke([HumanMessage(content=prompt)])
+        return {"chat_response": response.content}
+    except Exception as e:
+        logger.error(f"LLM API Error during chat: {e}")
+        return {"chat_response": f"LLM Connection Error: {str(e)}"}
+
+def build_chat_graph() -> StateGraph:
+    workflow = StateGraph(AgentState)
+    workflow.add_node("chat_node", chat_step)
+    workflow.set_entry_point("chat_node")
+    workflow.add_edge("chat_node", END)
+    return workflow.compile()
+
+chat_graph = build_chat_graph()
+
+def trigger_chat_pipeline(diff_text: str, chat_query: str) -> str:
+    state = {
+        "diff_text": diff_text,
+        "filename": "",
+        "full_files_context": "",
+        "tier": "",
+        "review_context": "",
+        "review_focus": "",
+        "review_result": "",
+        "chat_query": chat_query,
+        "chat_response": ""
+    }
+    result = chat_graph.invoke(state)
+    return result.get("chat_response", "无法生成回答。")
+
+def trigger_refiner_pipeline(diff_text: str, user_comment: str) -> str:
+    """
+    Acts as the Refiner Agent. Takes the PR diff and user's rebuttal,
+    synthesizes a structured JSON insight, and saves it to Qdrant as a staging patch.
+    """
+    logger.info("Triggering Refiner Agent...")
+    llm = init_llm()
+    prompt = (
+        f"你是一名架构规范总结师（Refiner Agent）。\n"
+        f"背景：一位开发者在你的代码评审留下了反驳意见。如果是你之前的误报（False Positive），\n"
+        f"请提取这背后的业务领域知识，并输出一段具有强上下文的架构认知更新。\n"
+        f"【严格禁止】：绝对禁止输出“不再检查 xxx”等粗暴的屏蔽性规则！\n\n"
+        f"【要求输出格式】：纯净的 JSON 格式，不要任何 Markdown 标记。必须包含：\n"
+        f"1. insight_text (针对业务逻辑的认知更新)\n"
+        f"2. rule_action (强硬路由控制，包含 action='DISABLE_SKILL', skill_name, path_regex)\n\n"
+        f"【原始 Diff】:\n{diff_text}\n\n"
+        f"【开发者反驳】:\n{user_comment}\n\n"
+        f"请输出 JSON:"
+    )
+    
+    try:
+        response = llm.invoke([HumanMessage(content=prompt)])
+        raw_text = response.content.strip()
+        import re, json
+        # Extract json safely
+        json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
+        if json_match:
+            try:
+                parsed_json = json.loads(json_match.group(0))
+                # Persist to Qdrant staging area
+                metadata = {
+                    "source": "Self-Reflection Loop",
+                    "type": "staging_patch",
+                    "path_regex": parsed_json.get("rule_action", {}).get("path_regex", ".*"),
+                    "rule_action": parsed_json.get("rule_action", {})
+                }
+                content_to_save = parsed_json.get("insight_text", "")
+                
+                # Ingest to Qdrant
+                from app.services.rag import ingest_knowledge
+                ingest_knowledge(content_to_save, metadata=metadata)
+                
+                rule_name = parsed_json.get("rule_action", {}).get("skill_name", "UNKNOWN")
+                return f"✅ **收到反馈，自愈机制已启动！**\n\n我已经将您的上下文提炼为新的架构认知，并记录进短期记忆池 (Staging DB)。\n下次审查命中相同路径的 PR 时，针对 `{rule_name}` 的检查将被拦截或软化。\n\n> 提炼的认知: *{content_to_save}*"
+            except Exception as e:
+                logger.error(f"Failed to parse Refiner json: {e}")
+                return "❌ 无法解析反馈认知，自愈闭环失败。"
+        return "❌ 无法生成规范资产。"
+    except Exception as e:
+        logger.error(f"LLM API Error during Refiner: {e}")
+        return f"❌ 内部反思特工执行错误: {str(e)}"
