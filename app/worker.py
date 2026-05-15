@@ -26,6 +26,15 @@ def run_async(coro):
 
 @celery_app.task(name="tasks.review_pipeline_job")
 def review_pipeline_job(repo_full_name: str, pr_number: int, commit_id: str, tier: str = "Tier-B", review_context: str = "", review_focus: str = ""):
+    """
+    【Celery 异步消费者核心】：执行真正耗时的 AI Review 流程
+    
+    工作流程：
+    1. 通过 GitHub API 获取完整的 PR 变更代码 (Diff)。
+    2. 触发 RAG 和双 Agent Pipeline (Reviewer + Critic) 进行深度代码审查。
+    3. 容灾设计：尝试提交精确的行级评论 (Inline Review)。如果由于 API 路径问题或权限
+       问题失败，自动 fallback（降级）为 PR 级别的全局评论，确保信息不丢失。
+    """
     logger.info(f"Starting Celery review job for {repo_full_name}#{pr_number} with tier {tier}")
     from app.services.github import fetch_pr_files_data, post_pr_review, post_pr_comment
     from app.services.rag import trigger_review_pipeline

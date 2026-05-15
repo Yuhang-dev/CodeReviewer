@@ -36,10 +36,16 @@ async def verify_signature(request: Request) -> bool:
 @router.post("/github")
 async def github_webhook(request: Request, background_tasks: BackgroundTasks):
     """
-    Receives push/PR events from GitHub, validates the signature, 
-    and triggers the Agentic RAG pipeline in the background.
+    【核心路由：GitHub Webhook 流量入口】
+    接收并处理来自 GitHub 的 push 和 PR 事件。
+    
+    架构设计亮点：
+    1. 极致轻量：不在此函数内做任何耗时的网络或 LLM 推理计算。
+    2. 安全性保障：通过 HMAC 算法校验请求签名，防止恶意伪造 Payload。
+    3. 异步解耦：仅进行 Metadata 解析，随后将任务状态封装进 Celery 队列，
+       立即返回 200 OK 给 GitHub，彻底避免 10s 超时截断问题。
     """
-    # 1. Verify Request Signature
+    # 1. Verify Request Signature (防止伪造攻击)
     await verify_signature(request)
     
     # 2. Parse Payload

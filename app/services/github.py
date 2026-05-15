@@ -72,16 +72,28 @@ async def fetch_pr_files_data(repo_full_name: str, pr_number: int, commit_id: st
             
         files_data = response.json()
         
+        # Language extension map for Qdrant metadata filtering
+        EXT_LANG_MAP = {
+            ".py": "python", ".go": "go", ".js": "javascript",
+            ".ts": "typescript", ".java": "java", ".rb": "ruby",
+            ".rs": "rust", ".cpp": "cpp", ".cs": "csharp",
+        }
+        
         for file_info in files_data:
             filename = file_info.get("filename")
             status = file_info.get("status")
             patch = file_info.get("patch", "")
             
+            import os
+            ext = os.path.splitext(filename or "")[1].lower()
+            language = EXT_LANG_MAP.get(ext, "all")
+            
             file_data = {
                 "filename": filename,
                 "status": status,
                 "patch": patch,
-                "full_content": ""
+                "full_content": "",
+                "language": language
             }
             
             # Skip removed files as we don't need their full current content

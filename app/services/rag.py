@@ -32,6 +32,7 @@ AVAILABLE_SKILLS = [
 class AgentState(TypedDict):
     diff_text: str
     filename: str
+    language: str
     full_files_context: str
     tier: str
     review_context: str
@@ -60,7 +61,14 @@ embeddings_model = HuggingFaceEmbeddings(model_name="BAAI/bge-small-zh-v1.5")
 
 
 from app.core.llm import init_llm
-def ingest_knowledge(content: str, metadata: dict = None) -> int:
+def ingest_knowledge(
+    content: str,
+    metadata: dict = None,
+    category: str = "general",
+    path_regex: str = ".*",
+    language: str = "python",
+    severity: str = "warning"
+) -> int:
     """
     Chunks the input markdown text, generates embeddings, and saves to Qdrant.
     """
@@ -76,11 +84,19 @@ def ingest_knowledge(content: str, metadata: dict = None) -> int:
     # Embed and upsert
     vectors = embeddings_model.embed_documents(chunks)
     
-    payloads = [{"content": chunk, **(metadata or {})} for chunk in chunks]
-    ids = list(range(len(chunks))) # In real app, use UUIDs
+    import uuid, datetime
+    base_metadata = {
+        "type": "guideline",
+        "category": category,
+        "path_regex": path_regex,
+        "language": language,
+        "severity": severity,
+        "source": "manual_ingest",
+        "created_at": datetime.datetime.utcnow().isoformat(),
+        **(metadata or {}),
+    }
     
-    # For MVP we just use sequential IDs. Existing IDs will be overwritten or we can use UUIDs:
-    import uuid
+    payloads = [{"content": chunk, **base_metadata} for chunk in chunks]
     ids = [str(uuid.uuid4()) for _ in chunks]
 
     qdrant_client.upsert(
@@ -95,16 +111,51 @@ def ingest_knowledge(content: str, metadata: dict = None) -> int:
     return len(chunks)
 
 
-def retrieve_guidelines(query_text: str, filename: str = "") -> tuple[str, list[str]]:
+def _rewrite_diff_to_intent(diff_text: str) -> str:
+    """
+    【Query Rewriting / HyDE 变体】
+    将代码 diff 翻译为自然语言的"风险意图描述"，使查询向量和文档向量处于同一语义空间。
+    """
+    try:
+        snippet = diff_text[:800]
+        llm = init_llm()
+        prompt = (
+            "你是一名代码安全架构师。请用 1-2 句简洁的中文描述下面这段代码变更的"
+            "核心意图和潜在工程风险点。\n"
+            "要求：\n"
+            "1. 不要输出任何代码片段或代码符号\n"
+            "2. 重点描述：这段变更在做什么，以及可能违反哪类编程规范\n"
+            "3. 如果变更是删除代码，请说明删除了什么功能\n\n"
+            f"【代码 Diff】:\n{snippet}"
+        )
+        response = llm.invoke([HumanMessage(content=prompt)])
+        intent = response.content.strip()
+        logger.info(f"Query rewritten: '{intent[:80]}...'")
+        return intent
+    except Exception as e:
+        logger.warning(f"Query rewriting failed, falling back to raw diff: {e}")
+        return diff_text
+
+def retrieve_guidelines(query_text: str, filename: str = "", language: str = "python") -> tuple[str, list[str]]:
     """
     Search Qdrant for relevant coding standards and staging patches.
     Returns: (formatted guidelines string, list of disabled skill names)
     """
     try:
-        query_vector = embeddings_model.embed_query(query_text)
+        human_readable_query = _rewrite_diff_to_intent(query_text)
+        query_vector = embeddings_model.embed_query(human_readable_query)
+        
+        from qdrant_client.models import Filter, FieldCondition, MatchAny
+        lang_filter = Filter(
+            should=[
+                FieldCondition(key="language", match=MatchAny(any=[language, "all"])),
+            ]
+        ) if language else None
+
         search_result = qdrant_client.query_points(
             collection_name=COLLECTION_NAME,
             query=query_vector,
+            query_filter=lang_filter,
             limit=5
         ).points
         
@@ -149,7 +200,8 @@ def review_code_step(state: AgentState):
     
     # 1. Retrieve Knowledge
     filename = state.get("filename", "")
-    retrieved_context, disabled_skills = retrieve_guidelines(state['diff_text'], filename)
+    language = state.get("language", "python")
+    retrieved_context, disabled_skills = retrieve_guidelines(state['diff_text'], filename, language)
     
     context_str = ""
     if retrieved_context.strip():
@@ -336,6 +388,7 @@ def trigger_review_pipeline(pr_files_data: list[dict], tier: str = "Tier-B", rev
             # Pass raw patch WITHOUT "File:" prefix so Skills compute correct line numbers
             "diff_text": file_data["patch"],
             "filename": file_data["filename"],
+            "language": file_data.get("language", "python"),
             "full_files_context": file_data["full_content"],
             "tier": tier,
             "review_context": review_context,
@@ -422,48 +475,82 @@ def trigger_chat_pipeline(diff_text: str, chat_query: str) -> str:
 
 def trigger_refiner_pipeline(diff_text: str, user_comment: str) -> str:
     """
-    Acts as the Refiner Agent. Takes the PR diff and user's rebuttal,
-    synthesizes a structured JSON insight, and saves it to Qdrant as a staging patch.
+    【Refiner Agent】从用户反馈中提炼知识并注入 Qdrant。
+
+    修复后的两阶段流程：
+    Phase 1 - 意图分类（Intent Classification）：
+        先判断用户评论是"误报驳回（False Positive Rejection）"还是"普通对话/追问"。
+        只有明确的误报驳回才进入规范提炼阶段，避免普通对话污染知识库。
+
+    Phase 2 - 条件提炼（Conditional Extraction）：
+        仅当 is_false_positive=true 时，提炼 insight_text 和 rule_action 并存入 Qdrant。
+        否则直接返回普通对话回复，不写入任何知识。
     """
     logger.info("Triggering Refiner Agent...")
     llm = init_llm()
     prompt = (
         f"你是一名架构规范总结师（Refiner Agent）。\n"
-        f"背景：一位开发者在你的代码评审留下了反驳意见。如果是你之前的误报（False Positive），\n"
-        f"请提取这背后的业务领域知识，并输出一段具有强上下文的架构认知更新。\n"
-        f"【严格禁止】：绝对禁止输出“不再检查 xxx”等粗暴的屏蔽性规则！\n\n"
-        f"【要求输出格式】：纯净的 JSON 格式，不要任何 Markdown 标记。必须包含：\n"
-        f"1. insight_text (针对业务逻辑的认知更新)\n"
-        f"2. rule_action (强硬路由控制，包含 action='DISABLE_SKILL', skill_name, path_regex)\n\n"
+        f"请先判断下面这条开发者评论的意图类型：\n\n"
+        f"【意图类型说明】：\n"
+        f"  A. 误报驳回（False Positive）：开发者明确否定了 AI 的审查意见，"
+        f"并解释为什么这段代码在当前上下文中是合理的。\n"
+        f"  B. 普通对话/追问（General Chat）：开发者在提问、讨论、或要求调整建议，"
+        f"并没有否定 AI 的审查意见本身。\n\n"
+        f"【输出要求】：纯 JSON，不含 Markdown。必须包含：\n"
+        f"  1. is_false_positive (bool): true 表示误报驳回，false 表示普通对话\n"
+        f"  2. insight_text (str): 仅 is_false_positive=true 时填写业务认知更新，"
+        f"否则为空字符串。严禁写出粗暴的屏蔽规则！\n"
+        f"  3. rule_action (dict): 仅 is_false_positive=true 时填写，包含:\n"
+        f"     action, skill_name, path_regex, category, language, severity\n"
+        f"     否则为空 dict {{}}\n\n"
         f"【原始 Diff】:\n{diff_text}\n\n"
-        f"【开发者反驳】:\n{user_comment}\n\n"
+        f"【开发者评论】:\n{user_comment}\n\n"
         f"请输出 JSON:"
     )
     
     try:
         response = llm.invoke([HumanMessage(content=prompt)])
         raw_text = response.content.strip()
-        import re, json
-        # Extract json safely
+        import re, json, datetime
         json_match = re.search(r'\{.*\}', raw_text, re.DOTALL)
         if json_match:
             try:
                 parsed_json = json.loads(json_match.group(0))
-                # Persist to Qdrant staging area
+
+                # Phase 1: 意图分类结果 — 不是误报驳回，直接返回普通回复
+                if not parsed_json.get("is_false_positive", False):
+                    logger.info("Refiner classified as general chat. Skipping knowledge injection.")
+                    return (
+                        f"感谢您的反馈！根据您的评论，这不属于需要更新规范的误报场景。\n"
+                        f"如果您想进一步讨论代码细节，欢迎继续提问。"
+                    )
+
+                # Phase 2: 确认是误报驳回，提炼并注入 Qdrant
+                content_to_save = parsed_json.get("insight_text", "")
+                if not content_to_save:
+                    return "❌ 无法提炼有效的规范认知，请尝试更详细地描述误报原因。"
+
                 metadata = {
                     "source": "Self-Reflection Loop",
                     "type": "staging_patch",
                     "path_regex": parsed_json.get("rule_action", {}).get("path_regex", ".*"),
-                    "rule_action": parsed_json.get("rule_action", {})
+                    "category": parsed_json.get("rule_action", {}).get("category", "general"),
+                    "language": parsed_json.get("rule_action", {}).get("language", "python"),
+                    "severity": parsed_json.get("rule_action", {}).get("severity", "warning"),
+                    "rule_action": parsed_json.get("rule_action", {}),
+                    "created_at": datetime.datetime.utcnow().isoformat(),
                 }
-                content_to_save = parsed_json.get("insight_text", "")
                 
-                # Ingest to Qdrant
-                from app.services.rag import ingest_knowledge
+                # 直接调用同文件函数，无需循环 import
                 ingest_knowledge(content_to_save, metadata=metadata)
                 
                 rule_name = parsed_json.get("rule_action", {}).get("skill_name", "UNKNOWN")
-                return f"✅ **收到反馈，自愈机制已启动！**\n\n我已经将您的上下文提炼为新的架构认知，并记录进短期记忆池 (Staging DB)。\n下次审查命中相同路径的 PR 时，针对 `{rule_name}` 的检查将被拦截或软化。\n\n> 提炼的认知: *{content_to_save}*"
+                return (
+                    f"✅ **收到误报反馈，自愈机制已启动！**\n\n"
+                    f"已将您的上下文提炼为架构认知补丁并写入知识库。\n"
+                    f"下次命中相同路径的 PR 时，`{rule_name}` 的检查将被软化或拦截。\n\n"
+                    f"> 提炼的认知: *{content_to_save}*"
+                )
             except Exception as e:
                 logger.error(f"Failed to parse Refiner json: {e}")
                 return "❌ 无法解析反馈认知，自愈闭环失败。"

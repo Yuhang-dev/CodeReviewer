@@ -22,6 +22,7 @@ An **Enterprise-Grade, Agentic RAG-powered Code Review System**. This project le
 This system is not a simple "prompt-in, prompt-out" wrapper. It implements a multi-agent orchestrated workflow using LangGraph concepts.
 
 ### 1. 🚦 Multi-Tier Routing (Tier-X)
+
 To prevent wasting high-cost LLM tokens on trivial changes, the system supports dynamic routing based on PR metadata. Developers can control the depth of the review by adding a metadata block to their PR description:
 
 ```text
@@ -31,27 +32,35 @@ Context: Implement core payment transaction lock.
 Focus: Race conditions, deadlock prevention, ACID compliance.
 >>>END<<<
 ```
+
 - **Tier-S (Deep Architecture)**: Triggers deep file-tree scanning and strict architectural compliance checks.
 - **Tier-A (Standard)**: Thorough logical review.
 - **Tier-B (Fast-Path)**: Lightweight syntax, style, and obvious bug checks (Default).
 
 ### 2. 💬 Interactive Refiner & Human-in-the-Loop (`@bot`)
+
 If the AI suggests a modification but you want a different approach, or if you need the AI to elaborate, simply reply to the PR comment:
 > `@bot please rewrite this using a switch-case statement instead.`
 
 The **Chat Pipeline** will instantly trigger, read the conversation history, and generate a newly revised code snippet in the thread.
 
 ### 3. 🛡️ False Positive Handling & Agentic Self-Correction
+
 Code review bots are notorious for generating noisy, false-positive comments. This system implements an **Agentic Critic mechanism**:
+
 1. **Draft Generation**: The primary Reviewer Agent drafts comments based on the code diff.
 2. **Critic Evaluation**: A secondary Critic Agent evaluates the draft against corporate guidelines retrieved from Qdrant.
 3. **Self-Correction**: If the Critic flags a comment as trivial, hallucinatory, or a "false positive" (e.g., complaining about a missing import that exists in another file), the comment is automatically dropped before it ever reaches GitHub.
 
-### 4. 🧠 Dynamic Knowledge Injection (Advanced RAG)
-Our RAG implementation goes beyond naive chunk-and-search vector retrieval:
-- **Rule Evolution**: When a senior developer rejects an AI comment via GitHub thread (e.g., `@bot this is a false positive, we allow this pattern in test files`), the **Refiner Agent** automatically extracts this new consensus.
-- **Staging Patches**: The new rule is formatted and injected into the Qdrant Vector DB as a `staging_patch`. Future PRs involving similar files will pull this patch into the LLM's context window, ensuring the AI "learns" from its mistakes and never repeats the same false positive.
+### 4. 🧠 Dynamic Knowledge Injection (Advanced RAG 2.0)
 
+Our RAG implementation goes far beyond naive chunk-and-search vector retrieval. It implements a **Hybrid Retrieval** architecture to bridge the semantic gap between code diffs and natural language:
+
+- **Query Rewriting (HyDE Variant)**: Direct vector matching between code symbols (`+ import os`) and natural language rules often fails due to the semantic gap. We use an LLM to dynamically translate code diffs into "intent descriptions" before querying Qdrant, drastically improving recall accuracy.
+- **Structured Metadata Schema**: Every guideline injected into Qdrant is tagged with a strict schema (`category`, `language`, `path_regex`, `severity`). The retrieval process uses Qdrant's `QueryFilter` to perform hard-filtering (e.g., Python rules will never pollute Go file reviews).
+- **Two-Phase Refiner Pipeline**: When a developer rejects an AI comment via the GitHub thread (`@bot this is a false positive`), the system triggers a two-phase pipeline:
+  1. **Intent Classification**: Determines if the comment is a true "False Positive Rejection" or just "General Chat", preventing conversational garbage from polluting the vector DB.
+  2. **Conditional Extraction**: If classified as a false positive, it extracts the domain context and injects a `staging_patch` into Qdrant. Future PRs will pull this patch, effectively granting the system a self-healing memory.
 ---
 
 ## 🏗️ System Architecture
@@ -80,12 +89,15 @@ graph TD;
 ## 🚀 Quick Start
 
 ### 1. Prerequisites
+
 - Docker & Docker Compose
 - A GitHub repository with Webhooks enabled
 - DeepSeek / OpenAI API Key
 
 ### 2. Environment Setup
+
 Create a `.env` file in the root directory:
+
 ```env
 # GitHub Auth
 GITHUB_TOKEN=ghp_your_classic_repo_token_here
@@ -101,13 +113,17 @@ REDIS_URL=redis://redis:6379/0
 ```
 
 ### 3. Deploy Infrastructure
+
 Run the following command to build the images and start the distributed system:
+
 ```bash
 docker-compose up -d --build
 ```
 
 ### 4. Verify Services
+
 You can verify the robust architecture by inspecting the container logs:
+
 ```bash
 # Watch the Gateway receive instant webhooks
 docker logs code_reviewer_api -f
