@@ -36,7 +36,7 @@ def review_pipeline_job(repo_full_name: str, pr_number: int, commit_id: str, tie
        问题失败，自动 fallback（降级）为 PR 级别的全局评论，确保信息不丢失。
     """
     logger.info(f"Starting Celery review job for {repo_full_name}#{pr_number} with tier {tier}")
-    from app.services.github import fetch_pr_files_data, post_pr_review, post_pr_comment
+    from app.services.github import fetch_pr_files_data, post_pr_review, post_pr_comment, shallow_clone_repo
     from app.services.rag import trigger_review_pipeline
     
     try:
@@ -45,11 +45,17 @@ def review_pipeline_job(repo_full_name: str, pr_number: int, commit_id: str, tie
             logger.info("No files modified or failed to fetch files.")
             return
 
+        # Clone the repo for Global Impact AST analysis if Tier requires it
+        repo_path = ""
+        if tier in ["TIER-S", "TIER-A", "Tier-S", "Tier-A"]:
+            repo_path = shallow_clone_repo(repo_full_name, branch="main") # Ideal is PR branch, using main as fallback
+            
         result_data = trigger_review_pipeline(
             files_data,
             tier=tier,
             review_context=review_context,
-            review_focus=review_focus
+            review_focus=review_focus,
+            repo_path=repo_path
         )
         
         review_comments = result_data.get("comments", [])
@@ -57,6 +63,7 @@ def review_pipeline_job(repo_full_name: str, pr_number: int, commit_id: str, tie
         
         if global_warning:
             run_async(post_pr_comment(repo_full_name, pr_number, f"⚠️ **Global Impact Warning ( {tier} )** ⚠️\n\n{global_warning}"))
+
         
         inline_success = False
         if review_comments:
