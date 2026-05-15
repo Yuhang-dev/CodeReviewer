@@ -40,6 +40,8 @@ class AgentState(TypedDict):
     review_result: str
     chat_query: str
     chat_response: str
+    repo_path: str
+    pr_filenames: list[str]
 
 def init_qdrant() -> QdrantClient:
     """Initialize connection to Qdrant vector database."""
@@ -61,6 +63,7 @@ embeddings_model = HuggingFaceEmbeddings(model_name="BAAI/bge-small-zh-v1.5")
 
 
 from app.core.llm import init_llm
+from app.skills.ast_tools import find_python_references, read_code_snippet
 def ingest_knowledge(
     content: str,
     metadata: dict = None,
@@ -347,21 +350,77 @@ def build_review_graph() -> StateGraph:
 graph = build_review_graph()
 
 def global_impact_step(state: AgentState):
-    """LangGraph node: Assesses cross-file backward compatibility."""
-    logger.info("Executing global_impact_step...")
+    """LangGraph node: Assesses cross-file backward compatibility using AST Tool Calling."""
+    logger.info("Executing global_impact_step with AST Tool Calling...")
+    
+    if not state.get("repo_path"):
+        logger.info("No repo_path provided. Skipping AST Global Impact check.")
+        return {"review_result": ""}
+        
     llm = init_llm()
+    # Bind AST tools for the LLM
+    from langchain_core.messages import HumanMessage, ToolMessage
+    llm_with_tools = llm.bind_tools([find_python_references, read_code_snippet])
+    
+    pr_filenames_str = ", ".join(state.get('pr_filenames', []))
+    prompt = f"""你是一位具备全栈代码库视野的全局架构师。
+你的任务是评估本次 PR 修改是否引发了跨文件的**破坏性变更（Breaking Changes）**。
+破坏性变更特指：修改了核心函数的参数签名、移除了函数、或者变更了返回值类型，这会导致其他未被修改的文件在调用时抛出异常。
+
+【核心审查执行逻辑 (必须遵守)】：
+1. 分析下方代码 Diff。如果**不涉及破坏性更改**（只是改了内部逻辑、新增文件等），请立刻停止，并严格输出空字符串。
+2. 如果存在破坏性更改，请明确提取被修改的核心函数名称。
+3. 主动调用工具 `find_python_references`，传入仓库路径和函数名，查找所有调用方。
+4. 【重要】：如果检索到的调用方文件已经存在于本次 PR 包含的文件列表中（[{pr_filenames_str}]），说明开发者已经同步修改了调用方代码。此时无需报错！
+5. 如果调用方文件【不在】上述 PR 文件列表中，请使用 `read_code_snippet` 读取调用上下文，确认是否真的会引发崩溃。
+6. 如果确认引发崩溃，请输出一段严厉的警告，明确指出未修改的文件及其行号。
+
+【仓库环境参数】
+- repo_path: {state.get('repo_path')}
+
+【代码 Diff 变更】:
+{state['diff_text']}
+"""
+
+    messages = [HumanMessage(content=prompt)]
+    
     try:
-        prompt = (
-            f"你是一位全局架构师。请仅评估以下文件的修改是否会导致**全局接口破坏**或**向后不兼容**。\n"
-            f"不需要指出具体行数代码错误，只需给出一个宏观警告。\n"
-            f"如果影响不大，返回严格的空字符串。\n"
-            f"如果有影响，请输出一段纯文本警告内容。\n\n"
-            f"【代码 Diff 变更】:\n{state['diff_text']}"
-        )
-        response = llm.invoke([HumanMessage(content=prompt)])
-        return {"review_result": response.content.strip()}
+        for _ in range(5): # Limit to 5 LLM interactions
+            response = llm_with_tools.invoke(messages)
+            messages.append(response)
+            
+            if not response.tool_calls:
+                break # LLM decided to reply normally
+                
+            for tool_call in response.tool_calls:
+                tool_name = tool_call["name"]
+                tool_args = tool_call["args"]
+                
+                try:
+                    if tool_name == "find_python_references":
+                        # Ensure repo_path is explicitly set to prevent LLM hallucinating paths
+                        tool_args["repo_path"] = state.get("repo_path")
+                        tool_result = find_python_references.invoke(tool_args)
+                    elif tool_name == "read_code_snippet":
+                        tool_args["repo_path"] = state.get("repo_path")
+                        tool_result = read_code_snippet.invoke(tool_args)
+                    else:
+                        tool_result = f"Error: Tool {tool_name} not found."
+                except Exception as e:
+                    tool_result = f"Tool execution error: {e}"
+                    
+                logger.info(f"[AST Agent] Executed {tool_name} -> {str(tool_result)[:100]}...")
+                messages.append(ToolMessage(content=str(tool_result), tool_call_id=tool_call["id"]))
+
+        final_content = response.content.strip()
+        # Clean up empty thoughts if LLM outputs only spaces
+        if not final_content:
+            return {"review_result": ""}
+            
+        return {"review_result": final_content}
+        
     except Exception as e:
-        logger.error(f"Global impact error: {e}")
+        logger.error(f"Global impact tool execution error: {e}")
         return {"review_result": ""}
 
 global_graph = StateGraph(AgentState)
@@ -370,7 +429,7 @@ global_graph.set_entry_point("global_impact")
 global_graph.add_edge("global_impact", END)
 global_impact_graph = global_graph.compile()
 
-def trigger_review_pipeline(pr_files_data: list[dict], tier: str = "Tier-B", review_context: str = "", review_focus: str = "") -> dict:
+def trigger_review_pipeline(pr_files_data: list[dict], tier: str = "Tier-B", review_context: str = "", review_focus: str = "", repo_path: str = "") -> dict:
     """
     Executes Local Review Agents natively concurrently per-file.
     Optionally executes Global Impact Agent if tier mandates it.
@@ -382,6 +441,8 @@ def trigger_review_pipeline(pr_files_data: list[dict], tier: str = "Tier-B", rev
         
     initial_states = []
     combined_diffs = ""
+    pr_filenames = [fd["filename"] for fd in pr_files_data]
+    
     for file_data in pr_files_data:
         combined_diffs += f"\nFile: {file_data['filename']}\n{file_data['patch']}\n"
         state = {
@@ -395,7 +456,9 @@ def trigger_review_pipeline(pr_files_data: list[dict], tier: str = "Tier-B", rev
             "review_focus": review_focus,
             "review_result": "", 
             "chat_query": "", 
-            "chat_response": ""
+            "chat_response": "",
+            "repo_path": repo_path,
+            "pr_filenames": pr_filenames
         }
         initial_states.append(state)
         
@@ -416,16 +479,20 @@ def trigger_review_pipeline(pr_files_data: list[dict], tier: str = "Tier-B", rev
 
     # 2. Sequential/Parallel Global Impact Analyzer (if tier allows)
     global_warning = ""
-    if tier in ["TIER-S", "TIER-A"]:
+    if tier in ["TIER-S", "TIER-A", "Tier-S", "Tier-A"]:
         gl_state = {
             "diff_text": combined_diffs,
+            "filename": "",
+            "language": "all",
             "full_files_context": "",
             "tier": tier,
             "review_context": review_context,
             "review_focus": review_focus,
             "review_result": "", 
             "chat_query": "", 
-            "chat_response": ""
+            "chat_response": "",
+            "repo_path": repo_path,
+            "pr_filenames": pr_filenames
         }
         res = global_impact_graph.invoke(gl_state)
         global_warning = res.get("review_result", "")
