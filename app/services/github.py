@@ -20,6 +20,61 @@ async def get_github_client() -> httpx.AsyncClient:
     )
 
 
+import os
+import shutil
+import subprocess
+
+def shallow_clone_repo(repo_full_name: str, branch: str = "main") -> str:
+    """
+    Shallow clones a GitHub repository to a local temporary directory for AST analysis.
+    Uses the GITHUB_TOKEN for authentication.
+    Returns the absolute path to the cloned repository.
+    """
+    base_cache_dir = "/tmp/repo_caches"
+    # Ensure Windows compatibility if running locally
+    if os.name == 'nt':
+        base_cache_dir = os.path.join(os.environ.get('TEMP', 'C:\\temp'), "repo_caches")
+        
+    repo_name = repo_full_name.replace("/", "_")
+    target_dir = os.path.join(base_cache_dir, f"{repo_name}_{branch}")
+    
+    # If already exists, delete it to ensure fresh state (since it's shallow and fast)
+    if os.path.exists(target_dir):
+        logger.info(f"Clearing existing repo cache at {target_dir}...")
+        try:
+            # On Windows, shutil.rmtree might fail on read-only git files, so handle it
+            import stat
+            def remove_readonly(func, path, excinfo):
+                os.chmod(path, stat.S_IWRITE)
+                func(path)
+            shutil.rmtree(target_dir, onerror=remove_readonly)
+        except Exception as e:
+            logger.warning(f"Failed to clear cache directory: {e}")
+            
+    os.makedirs(base_cache_dir, exist_ok=True)
+    
+    token = settings.GITHUB_TOKEN
+    # Construct authenticated URL
+    # format: https://oauth2:{token}@github.com/{repo_full_name}.git
+    auth_url = f"https://oauth2:{token}@github.com/{repo_full_name}.git" if token else f"https://github.com/{repo_full_name}.git"
+    
+    logger.info(f"Shallow cloning {repo_full_name} (branch: {branch}) to {target_dir}...")
+    
+    try:
+        # Run git clone --depth 1
+        subprocess.run(
+            ["git", "clone", "--depth", "1", "--branch", branch, auth_url, target_dir],
+            check=True,
+            capture_output=True,
+            text=True
+        )
+        logger.info("Clone successful.")
+        return target_dir
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Git clone failed: {e.stderr}")
+        return ""
+
+
 async def fetch_pr_diff(repo_full_name: str, pr_number: int) -> str:
     """
     Fetches the raw diff patch for a given pull request.
