@@ -1,3 +1,3 @@
-def trycallatest(a: int, b: str) -> int:
-    print(a, b)
-    return a+1
+def trycallatest(a: int) -> str:
+    print(a)
+    return a
