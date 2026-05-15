@@ -14,6 +14,7 @@ An **Enterprise-Grade, Agentic RAG-powered Code Review System**. This project le
 - ⚡ **Zero-Drop Asynchronous Queue**: Built on **Celery + Redis**, completely decoupling the GitHub Webhook (FastAPI) from heavy LLM inference. Eliminates GitHub's 10-second timeout constraints and ensures tasks survive container restarts (Robust Chaos Engineering).
 - 🐳 **One-Click Containerization**: Fully orchestrated via `docker-compose`. Includes Web API, Celery Worker, Redis Message Broker, and Qdrant DB.
 - 🔒 **Privacy & Offline Support**: Uses local HuggingFace Embedding models (`BAAI/bge-small-zh-v1.5`) with physical cache mounting (`HF_HUB_OFFLINE=1`). Embeddings are calculated strictly on-premise without network tracking.
+- 🔍 **AST‑Based Global Impact Analysis** – Detects cross‑file breaking changes; detailed reasoning is logged internally (worker logs) and not exposed in PR comments.
 
 ---
 

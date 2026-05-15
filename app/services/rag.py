@@ -428,17 +428,10 @@ def global_impact_step(state: AgentState):
         # Clean up empty thoughts if LLM outputs only spaces
         if not final_content:
             return {"review_result": ""}
-        
-        # Append the AST execution trace as a collapsible section
+
+        # Log the full AST trace for debugging, but don't expose it in the PR comment
         if tool_trace:
-            trace_section = (
-                "\n\n---\n"
-                "<details>\n"
-                "<summary>🤖 AST Agent 推理过程（点击展开）</summary>\n\n"
-                + "\n\n".join(tool_trace) +
-                "\n\n</details>"
-            )
-            final_content = final_content + trace_section
+            logger.info("[AST Agent] Full reasoning trace:\n" + "\n".join(tool_trace))
             
         return {"review_result": final_content}
         
