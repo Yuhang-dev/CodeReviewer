@@ -25,7 +25,7 @@ def run_async(coro):
     return asyncio.run(coro)
 
 @celery_app.task(name="tasks.review_pipeline_job")
-def review_pipeline_job(repo_full_name: str, pr_number: int, commit_id: str, tier: str = "Tier-B", review_context: str = "", review_focus: str = ""):
+def review_pipeline_job(repo_full_name: str, pr_number: int, commit_id: str, tier: str = "Tier-B", review_context: str = "", review_focus: str = "", base_branch: str = "master"):
     """
     【Celery 异步消费者核心】：执行真正耗时的 AI Review 流程
     
@@ -48,7 +48,9 @@ def review_pipeline_job(repo_full_name: str, pr_number: int, commit_id: str, tie
         # Clone the repo for Global Impact AST analysis if Tier requires it
         repo_path = ""
         if tier in ["TIER-S", "TIER-A", "Tier-S", "Tier-A"]:
-            repo_path = shallow_clone_repo(repo_full_name, branch="main") # Ideal is PR branch, using main as fallback
+            repo_path = shallow_clone_repo(repo_full_name, branch=base_branch)
+            if not repo_path:
+                logger.warning(f"Shallow clone failed for branch '{base_branch}'. AST analysis will be skipped.")
             
         result_data = trigger_review_pipeline(
             files_data,

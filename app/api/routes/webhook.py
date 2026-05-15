@@ -67,7 +67,9 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
             repo_full_name = payload["repository"]["full_name"]
             pr_number = payload["pull_request"]["number"]
             pr_body = payload["pull_request"].get("body", "") or ""
-            logger.info(f"Processing PR event for {repo_full_name}#{pr_number}, action: {action}")
+            # Extract the actual base branch name from the PR payload (could be 'master', 'main', 'develop', etc.)
+            base_branch = payload["pull_request"]["base"]["ref"]
+            logger.info(f"Processing PR event for {repo_full_name}#{pr_number}, action: {action}, base_branch: {base_branch}")
             
             # Parse Tiered Code Review Metadata
             import re
@@ -103,7 +105,8 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
                 commit_id, 
                 tier=tier, 
                 review_context=review_context, 
-                review_focus=review_focus
+                review_focus=review_focus,
+                base_branch=base_branch
             )
             
             return {"status": "accepted", "message": "Code review pipeline triggered via Celery"}

@@ -383,6 +383,7 @@ def global_impact_step(state: AgentState):
 """
 
     messages = [HumanMessage(content=prompt)]
+    tool_trace = []  # Collect AST execution steps for display in PR comment
     
     try:
         for _ in range(5): # Limit to 5 LLM interactions
@@ -401,13 +402,24 @@ def global_impact_step(state: AgentState):
                         # Ensure repo_path is explicitly set to prevent LLM hallucinating paths
                         tool_args["repo_path"] = state.get("repo_path")
                         tool_result = find_python_references.invoke(tool_args)
+                        tool_trace.append(
+                            f"🔍 **AST 扫描** `find_python_references(function_name='{tool_args.get('function_name', '')}')`\n"
+                            f"```\n{str(tool_result)}\n```"
+                        )
                     elif tool_name == "read_code_snippet":
                         tool_args["repo_path"] = state.get("repo_path")
                         tool_result = read_code_snippet.invoke(tool_args)
+                        tool_trace.append(
+                            f"📄 **读取代码** `read_code_snippet(file='{tool_args.get('relative_file_path', '')}', "
+                            f"lines={tool_args.get('start_line', '?')}-{tool_args.get('end_line', '?')})`\n"
+                            f"```python\n{str(tool_result)}\n```"
+                        )
                     else:
                         tool_result = f"Error: Tool {tool_name} not found."
+                        tool_trace.append(f"❓ 未知工具: `{tool_name}`")
                 except Exception as e:
                     tool_result = f"Tool execution error: {e}"
+                    tool_trace.append(f"❌ 工具执行失败: `{tool_name}` → {e}")
                     
                 logger.info(f"[AST Agent] Executed {tool_name} -> {str(tool_result)[:100]}...")
                 messages.append(ToolMessage(content=str(tool_result), tool_call_id=tool_call["id"]))
@@ -416,6 +428,17 @@ def global_impact_step(state: AgentState):
         # Clean up empty thoughts if LLM outputs only spaces
         if not final_content:
             return {"review_result": ""}
+        
+        # Append the AST execution trace as a collapsible section
+        if tool_trace:
+            trace_section = (
+                "\n\n---\n"
+                "<details>\n"
+                "<summary>🤖 AST Agent 推理过程（点击展开）</summary>\n\n"
+                + "\n\n".join(tool_trace) +
+                "\n\n</details>"
+            )
+            final_content = final_content + trace_section
             
         return {"review_result": final_content}
         
