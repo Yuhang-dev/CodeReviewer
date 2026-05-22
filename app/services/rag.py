@@ -314,12 +314,14 @@ def higher_tier(tier1: Optional[str], tier2: str) -> str:
         return tier2
 
     # Normalize
-    t1 = tier1.strip().upper()
-    t2 = tier2.strip().upper()
-
-    # Handle casing (expecting like Tier-C)
-    t1 = f"Tier-{t1[-1]}" if t1.startswith("TIER-") else tier1
-    t2 = f"Tier-{t2[-1]}" if t2.startswith("TIER-") else tier2
+    def normalize(t):
+        parts = t.strip().upper().split('-')
+        if len(parts) == 2 and parts[0] in ['TIER', 'TIER']:
+            return f"Tier-{parts[-1]}"
+        return t
+        
+    t1 = normalize(tier1)
+    t2 = normalize(tier2)
 
     rank1 = TIER_RANK.get(t1, 1)  # default B
     rank2 = TIER_RANK.get(t2, 1)
@@ -810,9 +812,23 @@ def trigger_review_pipeline(pr_files_data: list[dict], tier: str = "Tier-B", rev
             "language": "all",
             "full_files_context": "",
             "tier": resolved_tier,
+            "user_requested_tier": tier,
             "repo_path": repo_path,
             "pr_filenames": pr_filenames,
-            "agent_trace": []
+            "plan": {},
+            "retrieved_guidelines": [],
+            "disabled_skills": [],
+            "raw_reviews": [],
+            "final_reviews": [],
+            "dropped_reviews": [],
+            "final_comments": [],
+            "agent_trace": [],
+            "trace_markdown": "",
+            "chat_query": "",
+            "chat_response": "",
+            "review_result": "",
+            "review_context": review_context,
+            "review_focus": review_focus
         }
         res = global_impact_graph.invoke(gl_state)
         global_warning = res.get("review_result", "")

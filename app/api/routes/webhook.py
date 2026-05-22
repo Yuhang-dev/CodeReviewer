@@ -134,7 +134,8 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
             is_approve_trigger = re.search(r"@(?:bot|ai)\s+approve-rule\s+([a-f0-9\-]+)", comment_body.lower())
             is_delete_trigger = re.search(r"@(?:bot|ai)\s+delete-rule\s+([a-f0-9\-]+)", comment_body.lower())
             is_refiner_trigger = "[误报]" in comment_body or "[misjudge]" in comment_body.lower()
-            is_chat_trigger = "@ai" in comment_body.lower() or "@bot" in comment_body.lower()
+            is_review_trigger = re.search(r"@(?:bot|ai)\s+review", comment_body.lower())
+            is_chat_trigger = ("@ai" in comment_body.lower() or "@bot" in comment_body.lower()) and not (is_review_trigger or is_approve_trigger or is_delete_trigger)
             
             # The id of the comment we are replying to
             comment_id = payload.get("comment", {}).get("id")
@@ -168,6 +169,45 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
                 from app.worker import refiner_pipeline_job
                 refiner_pipeline_job.delay(repo_full_name, pr_number, comment_body, event_type, comment_id)
                 return {"status": "accepted", "message": "Refiner pipeline triggered via Celery"}
+                
+            elif is_review_trigger:
+                logger.info(f"Processing manual review request for {repo_full_name}#{pr_number}")
+                from app.worker import review_pipeline_job
+                # Fetch head commit ID early
+                commit_id = await fetch_pr_head_commit(repo_full_name, pr_number)
+                # Parse tier and context from PR body if needed, or default
+                pr_body = payload["pull_request"].get("body", "") or "" if "pull_request" in payload else ""
+                tier = "Tier-B"
+                review_context = ""
+                review_focus = ""
+                import re
+                match = re.search(r'>>>REVIEW_METADATA<<<(.*?)(?:>>>END<<<|$)', pr_body, re.DOTALL)
+                if match:
+                    meta_text = match.group(1).strip()
+                    tier_match = re.search(r'Tier:\s*(Tier-[SABC])', meta_text, re.IGNORECASE)
+                    if tier_match:
+                        tier = tier_match.group(1).upper()
+                    
+                    context_match = re.search(r'Context:\s*(.*?)(?=\n(?:Tier|Focus):|$)', meta_text, re.IGNORECASE | re.DOTALL)
+                    if context_match:
+                        review_context = context_match.group(1).strip()
+                        
+                    focus_match = re.search(r'Focus:\s*(.*?)(?=\n(?:Tier|Context):|$)', meta_text, re.IGNORECASE | re.DOTALL)
+                    if focus_match:
+                        review_focus = focus_match.group(1).strip()
+
+                base_branch = payload["pull_request"]["base"]["ref"] if "pull_request" in payload else "master"
+                
+                review_pipeline_job.delay(
+                    repo_full_name, 
+                    pr_number, 
+                    commit_id, 
+                    tier=tier, 
+                    review_context=review_context, 
+                    review_focus=review_focus,
+                    base_branch=base_branch
+                )
+                return {"status": "accepted", "message": "Manual review triggered"}
                 
             elif is_chat_trigger:
                 logger.info(f"Processing chat comment for {repo_full_name}#{pr_number}")
