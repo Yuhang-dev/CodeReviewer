@@ -375,8 +375,8 @@ You MUST return ONLY a valid JSON object matching the following structure:
 
         trace_event = {
             "node": "planner_step",
-            "summary": f"Resolved tier to {plan.final_tier} (User: {user_tier}, System: {plan.system_inferred_tier})",
-            "data": {"selected_checks": plan.selected_checks, "reason": plan.tier_resolution_reason}
+            "summary": f"已将代码风险评级定为 {plan.final_tier} (用户请求: {user_tier}, 系统推断: {plan.system_inferred_tier})",
+            "data": plan_dict
         }
 
         return {
@@ -423,7 +423,7 @@ def retrieve_step(state: AgentState):
 
     trace_event = {
         "node": "retrieve_step",
-        "summary": f"Retrieved guidelines. Disabled skills: {disabled_skills}",
+        "summary": f"检索到企业规范。已禁用技能: {disabled_skills}",
         "data": {"disabled_skills": disabled_skills}
     }
 
@@ -507,7 +507,7 @@ def reviewer_step(state: AgentState):
 
         trace_event = {
             "node": "reviewer_step",
-            "summary": f"Generated {len(raw_reviews)} candidate findings",
+            "summary": f"生成了 {len(raw_reviews)} 条初步审查意见",
             "data": {"count": len(raw_reviews)}
         }
 
@@ -565,16 +565,16 @@ def critic_step(state: AgentState):
     final_reviews = []
     if llm_candidates:
         llm = init_llm().bind(response_format={'type': 'json_object'})
-        prompt = f"""You are a Critic Agent. Verify the following candidate code review findings.
-Drop a finding if:
-- It is purely a subjective style preference without evidence.
-- The evidence provided does not strongly support the comment.
-- It contradicts best practices.
+        prompt = f"""你是一个 Critic Agent (代码审查校验员)。请仔细验证以下生成的代码审查意见。
+你需要根据以下规则丢弃（Drop）不合理的意见：
+- 纯粹是主观的代码风格偏好，且没有提供有力的证据。
+- 提供的证据与评论内容不符或不足以支撑该评论。
+- 评论内容本身违背了最佳实践。
 
-Candidate findings:
+候选意见列表：
 {llm_candidates}
 
-Output which to keep and which to drop (with reasons).
+请输出哪些意见应该保留（kept），哪些应该丢弃（dropped），并给出丢弃的原因。
 You MUST return ONLY a valid JSON object matching the following structure:
 """ + """{
   "kept": [
@@ -590,7 +590,7 @@ You MUST return ONLY a valid JSON object matching the following structure:
   "dropped": [
     {
       "finding": {},
-      "reason": "string"
+      "reason": "中文说明被丢弃的原因"
     }
   ]
 }
@@ -613,7 +613,7 @@ You MUST return ONLY a valid JSON object matching the following structure:
 
     trace_event = {
         "node": "critic_step",
-        "summary": f"Critic verified findings. Kept: {len(final_reviews)}, Dropped: {len(dropped)}",
+        "summary": f"Critic 校验完毕。保留了: {len(final_reviews)} 条，拦截了: {len(dropped)} 条",
         "data": {"dropped": [d.get("reason") for d in dropped]}
     }
 
@@ -688,18 +688,24 @@ def global_impact_step(state: AgentState):
 破坏性变更特指：修改了核心函数的参数签名、移除了函数、或者变更了返回值类型，这会导致其他未被修改的文件在调用时抛出异常。
 
 【核心审查执行逻辑 (必须遵守)】：
-1. 分析下方代码 Diff。如果**不涉及破坏性更改**（只是改了内部逻辑、新增文件等），请立刻停止，并严格输出空字符串。
+1. 分析下方代码 Diff。如果**不涉及破坏性更改**（只是改了内部逻辑、新增文件等），请立刻停止，并输出 "is_breaking": false。
 2. 如果存在破坏性更改，请明确提取被修改的核心函数名称。
 3. 主动调用工具 `find_python_references`，传入仓库路径和函数名，查找所有调用方。
 4. 【重要】：如果检索到的调用方文件已经存在于本次 PR 包含的文件列表中（[{pr_filenames_str}]），说明开发者已经同步修改了调用方代码。此时无需报错！
 5. 如果调用方文件【不在】上述 PR 文件列表中，请使用 `read_code_snippet` 读取调用上下文，确认是否真的会引发崩溃。
-6. 如果确认引发崩溃，请输出一段严厉的警告，明确指出未修改的文件及其行号。
+6. 如果确认引发崩溃，请在 warning_msg 中输出一段严厉的警告，明确指出未修改的文件及其行号。
 
 【仓库环境参数】
 - repo_path: {state.get('repo_path')}
 
 【代码 Diff 变更】:
 {state['diff_text']}
+
+You MUST return ONLY a valid JSON object matching the following structure:
+{{
+  "is_breaking": true/false,
+  "warning_msg": "中文警告信息，如果没有破坏性变更，则为空字符串"
+}}
 """
 
     messages = [HumanMessage(content=prompt)]
