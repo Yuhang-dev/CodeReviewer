@@ -22,8 +22,8 @@ from app.skills.idempotency_check import idempotency_check
 from app.skills.api_resilience_check import api_resilience_check
 
 AVAILABLE_SKILLS = [
-    type_hints_check, 
-    print_statement_check, 
+    type_hints_check,
+    print_statement_check,
     hardcoded_secrets_check,
     idempotency_check,
     api_resilience_check
@@ -32,11 +32,13 @@ AVAILABLE_SKILLS = [
 from pydantic import BaseModel, Field
 from typing import Literal, Optional
 
+
 class PlannedFile(BaseModel):
     path: str
     language: str
     risk_reasons: list[str]
     selected_checks: list[str]
+
 
 class PlannerOutput(BaseModel):
     user_requested_tier: Optional[str]
@@ -46,12 +48,14 @@ class PlannerOutput(BaseModel):
     selected_checks: list[str]
     files: list[PlannedFile]
 
+
 class RetrievedGuideline(BaseModel):
     content: str
     category: str = "general"
     language: str = "all"
     severity: str = "warning"
     source: str = "qdrant"
+
 
 class ReviewFinding(BaseModel):
     file: str
@@ -61,14 +65,17 @@ class ReviewFinding(BaseModel):
     evidence: Optional[str] = None
     severity: Literal["info", "warning", "error"]
 
+
 class CriticDecision(BaseModel):
     kept: list[ReviewFinding]
-    dropped: list[dict] # dict containing finding details and a `reason` for dropping
+    dropped: list[dict]  # dict containing finding details and a `reason` for dropping
+
 
 class AgentTraceEvent(BaseModel):
     node: str
     summary: str
     data: dict = {}
+
 
 class AgentState(TypedDict):
     # Inputs
@@ -79,33 +86,33 @@ class AgentState(TypedDict):
     pr_filenames: list[str]
     user_requested_tier: Optional[str]
     repo_path: str
-    
+
     # Legacy Inputs for backward compatibility with webhook currently
     tier: str
     review_context: str
     review_focus: str
-    
+
     # MAS State
-    plan: dict # PlannerOutput dump
-    retrieved_guidelines: list[dict] # list of RetrievedGuideline dumps
+    plan: dict  # PlannerOutput dump
+    retrieved_guidelines: list[dict]  # list of RetrievedGuideline dumps
     disabled_skills: list[str]
-    raw_reviews: list[dict] # list of ReviewFinding dumps
-    final_reviews: list[dict] # kept ReviewFinding dumps
+    raw_reviews: list[dict]  # list of ReviewFinding dumps
+    final_reviews: list[dict]  # kept ReviewFinding dumps
     dropped_reviews: list[dict]
-    final_comments: list[dict] # Legacy format for GitHub webhook
-    agent_trace: list[dict] # list of AgentTraceEvent dumps
+    final_comments: list[dict]  # Legacy format for GitHub webhook
+    agent_trace: list[dict]  # list of AgentTraceEvent dumps
     trace_markdown: str
-    
+
     # Chat State
     chat_query: str
     chat_response: str
-    review_result: str # legacy
+    review_result: str  # legacy
 
 
 def init_qdrant() -> QdrantClient:
     """Initialize connection to Qdrant vector database."""
     client = QdrantClient(url=settings.QDRANT_URL, api_key=settings.QDRANT_API_KEY)
-    
+
     # Ensure collection exists
     if not client.collection_exists(collection_name=COLLECTION_NAME):
         logger.info(f"Creating Qdrant collection: {COLLECTION_NAME}")
@@ -115,38 +122,40 @@ def init_qdrant() -> QdrantClient:
         )
     return client
 
+
 # Singleton clients
 qdrant_client = init_qdrant()
 # Fast, local, private embeddings
 embeddings_model = HuggingFaceEmbeddings(model_name="BAAI/bge-small-zh-v1.5")
 
-
 from app.core.llm import init_llm
 from app.skills.ast_tools import find_python_references, read_code_snippet
+
+
 def ingest_knowledge(
-    content: str,
-    metadata: dict = None,
-    category: str = "general",
-    path_regex: str = ".*",
-    language: str = "python",
-    severity: str = "warning",
-    rule_id: str = None
+        content: str,
+        metadata: dict = None,
+        category: str = "general",
+        path_regex: str = ".*",
+        language: str = "python",
+        severity: str = "warning",
+        rule_id: str = None
 ) -> list[str]:
     """
     Chunks the input markdown text, generates embeddings, and saves to Qdrant.
     """
     logger.info("Ingesting knowledge text...")
-    
+
     # Text splitting
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
     chunks = text_splitter.split_text(content)
-    
+
     if not chunks:
         return 0
 
     # Embed and upsert
     vectors = embeddings_model.embed_documents(chunks)
-    
+
     import uuid, datetime
     base_metadata = {
         "type": "guideline",
@@ -158,7 +167,7 @@ def ingest_knowledge(
         "created_at": datetime.datetime.utcnow().isoformat(),
         **(metadata or {}),
     }
-    
+
     payloads = [{"content": chunk, **base_metadata} for chunk in chunks]
     ids = [rule_id] if rule_id and len(chunks) == 1 else [str(uuid.uuid4()) for _ in chunks]
 
@@ -169,9 +178,10 @@ def ingest_knowledge(
             for id_, vector, payload in zip(ids, vectors, payloads)
         ],
     )
-    
+
     logger.info(f"Ingested {len(chunks)} chunks successfully.")
     return ids
+
 
 def approve_knowledge_rule(rule_id: str) -> bool:
     """Approve a staging rule by moving it to production status."""
@@ -187,6 +197,7 @@ def approve_knowledge_rule(rule_id: str) -> bool:
     except Exception as e:
         logger.error(f"Failed to approve rule {rule_id}: {e}")
         return False
+
 
 def delete_knowledge_rule(rule_id: str) -> bool:
     """Delete a knowledge rule by ID."""
@@ -227,6 +238,7 @@ def _rewrite_diff_to_intent(diff_text: str) -> str:
         logger.warning(f"Query rewriting failed, falling back to raw diff: {e}")
         return diff_text
 
+
 def retrieve_guidelines(query_text: str, filename: str = "", language: str = "python") -> tuple[str, list[str]]:
     """
     Search Qdrant for relevant coding standards and staging patches.
@@ -235,7 +247,7 @@ def retrieve_guidelines(query_text: str, filename: str = "", language: str = "py
     try:
         human_readable_query = _rewrite_diff_to_intent(query_text)
         query_vector = embeddings_model.embed_query(human_readable_query)
-        
+
         from qdrant_client.models import Filter, FieldCondition, MatchAny
         lang_filter = Filter(
             should=[
@@ -249,15 +261,15 @@ def retrieve_guidelines(query_text: str, filename: str = "", language: str = "py
             query_filter=lang_filter,
             limit=5
         ).points
-        
+
         guidelines = []
         disabled_skills = []
         import re
-        
+
         for hit in search_result:
             content = hit.payload.get("content", "")
             metadata = hit.payload.get("metadata", {})
-            
+
             # Metadata-driven Action Routine
             if metadata.get("type") == "staging_patch":
                 path_regex = metadata.get("path_regex", ".*")
@@ -266,13 +278,13 @@ def retrieve_guidelines(query_text: str, filename: str = "", language: str = "py
                     logger.info(f"Filtered out staging patch due to path mismatch: {path_regex} for {filename}")
                     continue
                 status = metadata.get("status", "production")
-                
+
                 # If matched, apply the patch text
                 if status == "staging":
                     guidelines.append(f"【待审批规则 - 仅供参考】: {content}")
                 else:
                     guidelines.append(f"【自愈纠偏补丁】: {content}")
-                
+
                 # Suppress the skill via Route Action
                 action = metadata.get("rule_action", {}).get("action")
                 skill_name = metadata.get("rule_action", {}).get("skill_name")
@@ -282,7 +294,7 @@ def retrieve_guidelines(query_text: str, filename: str = "", language: str = "py
             else:
                 # Ordinary enterprise guidelines
                 guidelines.append(content)
-                
+
         return "\n\n".join(guidelines), disabled_skills
     except Exception as e:
         logger.error(f"Vector search failed: {e}")
@@ -296,22 +308,24 @@ TIER_RANK = {
     "Tier-S": 3,
 }
 
+
 def higher_tier(tier1: Optional[str], tier2: str) -> str:
     if not tier1:
         return tier2
-    
+
     # Normalize
     t1 = tier1.strip().upper()
     t2 = tier2.strip().upper()
-    
+
     # Handle casing (expecting like Tier-C)
     t1 = f"Tier-{t1[-1]}" if t1.startswith("TIER-") else tier1
     t2 = f"Tier-{t2[-1]}" if t2.startswith("TIER-") else tier2
-    
-    rank1 = TIER_RANK.get(t1, 1) # default B
+
+    rank1 = TIER_RANK.get(t1, 1)  # default B
     rank2 = TIER_RANK.get(t2, 1)
-    
+
     return t1 if rank1 >= rank2 else t2
+
 
 def planner_step(state: AgentState):
     """LangGraph node: Determines review strategy and tier resolution."""
@@ -319,9 +333,9 @@ def planner_step(state: AgentState):
     diff_text = state.get('diff_text', '')
     user_tier = state.get('user_requested_tier') or state.get('tier')
     pr_filenames = state.get('pr_filenames', [])
-    
-    llm = init_llm().with_structured_output(PlannerOutput)
-    
+
+    llm = init_llm().bind(response_format={'type': 'json_object'})
+
     prompt = f"""You are a Planner Agent for a Code Review System.
 Analyze the following PR metadata and diff to determine the review strategy.
 
@@ -336,19 +350,29 @@ Analyze the following PR metadata and diff to determine the review strategy.
 3. Provide `tier_resolution_reason`.
 4. Decide `selected_checks` (e.g. 'security', 'type_hints', 'idempotency', 'global_impact', 'style').
 5. Provide a plan for this specific file in the `files` list.
+
+You MUST return ONLY a valid JSON object matching the following structure:
+""" + """{
+  "user_requested_tier": "string | null",
+  "system_inferred_tier": "string",
+  "final_tier": "string",
+  "tier_resolution_reason": "string",
+  "selected_checks": ["string"],
+  "files": [{"path": "string", "language": "string", "risk_reasons": ["string"], "selected_checks": ["string"]}]
+}
 """
     try:
         plan: PlannerOutput = llm.invoke([HumanMessage(content=prompt)])
         plan_dict = plan.dict()
-        
+
         trace_event = {
             "node": "planner_step",
             "summary": f"Resolved tier to {plan.final_tier} (User: {user_tier}, System: {plan.system_inferred_tier})",
             "data": {"selected_checks": plan.selected_checks, "reason": plan.tier_resolution_reason}
         }
-        
+
         return {
-            "plan": plan_dict, 
+            "plan": plan_dict,
             "agent_trace": state.get("agent_trace", []) + [trace_event]
         }
     except Exception as e:
@@ -362,7 +386,9 @@ Analyze the following PR metadata and diff to determine the review strategy.
             "selected_checks": ["general"],
             "files": []
         }
-        return {"plan": fallback, "agent_trace": state.get("agent_trace", []) + [{"node": "planner_step", "summary": "Planner failed, used fallback", "data": {}}]}
+        return {"plan": fallback, "agent_trace": state.get("agent_trace", []) + [
+            {"node": "planner_step", "summary": "Planner failed, used fallback", "data": {}}]}
+
 
 def retrieve_step(state: AgentState):
     """LangGraph node: Retrieves guidelines and disables skills based on metadata."""
@@ -371,11 +397,11 @@ def retrieve_step(state: AgentState):
     filename = state.get("filename", "")
     language = state.get("language", "python")
     diff_text = state.get("diff_text", "")
-    
+
     # We use the existing retrieve_guidelines but adapt it to return structured data if needed.
     # For now, we wrap it to match the new state requirements.
     retrieved_context_str, disabled_skills = retrieve_guidelines(diff_text, filename, language)
-    
+
     # Mocking structure since existing retrieve_guidelines returns a string
     guidelines = []
     if retrieved_context_str.strip():
@@ -386,20 +412,23 @@ def retrieve_step(state: AgentState):
             "severity": "warning",
             "source": "qdrant"
         })
-        
+
     trace_event = {
         "node": "retrieve_step",
         "summary": f"Retrieved guidelines. Disabled skills: {disabled_skills}",
         "data": {"disabled_skills": disabled_skills}
     }
-    
+
     return {
-        "retrieved_guidelines": guidelines, 
+        "retrieved_guidelines": guidelines,
         "disabled_skills": disabled_skills,
         "agent_trace": state.get("agent_trace", []) + [trace_event]
     }
+
+
 class ReviewerOutput(BaseModel):
     findings: list[ReviewFinding]
+
 
 def reviewer_step(state: AgentState):
     """LangGraph node: Generates candidate review findings."""
@@ -408,19 +437,20 @@ def reviewer_step(state: AgentState):
     tier = plan.get("final_tier", "Tier-B")
     disabled_skills = state.get("disabled_skills", [])
     diff_text = state.get('diff_text', '')
-    
+
     if tier.upper() == "TIER-C":
         logger.info("Tier-C detected. Skipping LLM code review.")
         return {
             "raw_reviews": [],
-            "agent_trace": state.get("agent_trace", []) + [{"node": "reviewer_step", "summary": "Skipped due to Tier-C", "data": {}}]
+            "agent_trace": state.get("agent_trace", []) + [
+                {"node": "reviewer_step", "summary": "Skipped due to Tier-C", "data": {}}]
         }
-        
+
     # Same skill logic as before, run print_statement_check, hardcoded_secrets_check, etc.
     # ... I will copy the skill execution logic ...
-    
-    llm = init_llm().with_structured_output(ReviewerOutput)
-    
+
+    llm = init_llm().bind(response_format={'type': 'json_object'})
+
     tier_requirements = ""
     if tier.upper() == "TIER-S":
         tier_requirements = "这是极核心/安全底层的代码，请【极其严苛】地审查并发状态、死锁、内存泄漏、防重放、越权和 SQL 注入等致命问题！"
@@ -428,31 +458,44 @@ def reviewer_step(state: AgentState):
         tier_requirements = "这是核心业务逻辑，请侧重检查异常边界条件、空指针、重试逻辑和幂等性是否有缺失。"
     else:
         tier_requirements = "请重点查验基础规范、Type Hints、命名和是否有明显错误即可。"
-        
+
     context_str = ""
     for g in state.get("retrieved_guidelines", []):
         context_str += f"- {g['content']}\n"
     if context_str:
         context_str = f"【企业代码规范参考】:\n{context_str}\n\n请务必检查是否违反规范。\n"
-        
+
     prompt = (
         f"你是一位资深工程师。请使用中文审查代码变更。\n"
         f"要求：\n1. {tier_requirements}\n2. Diff 中每行以 L+数字 开头（如 L15），你必须使用该真实行号！\n\n"
         f"{context_str}\n"
         f"【完整文件上下文】:\n{state.get('full_files_context', '')}\n\n"
-        f"【代码 Diff 变更】:\n{annotate_diff_with_line_numbers(diff_text)}\n"
+        f"【代码 Diff 变更】:\n{annotate_diff_with_line_numbers(diff_text)}\n\n"
+        "You MUST return ONLY a valid JSON object matching the following structure:\n"
+        "{\n"
+        "  \"findings\": [\n"
+        "    {\n"
+        "      \"file\": \"string\",\n"
+        "      \"line\": 123,\n"
+        "      \"comment\": \"string\",\n"
+        "      \"check\": \"string\",\n"
+        "      \"evidence\": \"string | null\",\n"
+        "      \"severity\": \"info | warning | error\"\n"
+        "    }\n"
+        "  ]\n"
+        "}"
     )
-    
+
     try:
         response: ReviewerOutput = llm.invoke([HumanMessage(content=prompt)])
         raw_reviews = [f.dict() for f in response.findings]
-        
+
         trace_event = {
             "node": "reviewer_step",
             "summary": f"Generated {len(raw_reviews)} candidate findings",
             "data": {"count": len(raw_reviews)}
         }
-        
+
         return {
             "raw_reviews": raw_reviews,
             "agent_trace": state.get("agent_trace", []) + [trace_event]
@@ -461,16 +504,17 @@ def reviewer_step(state: AgentState):
         logger.error(f"Reviewer LLM failed: {e}")
         return {"raw_reviews": []}
 
+
 def critic_step(state: AgentState):
     """LangGraph node: Hybrid critic (Deterministic + LLM) to filter findings."""
     logger.info("Executing critic_step...")
     raw_reviews = state.get("raw_reviews", [])
     pr_filenames = state.get("pr_filenames", [])
     diff_text = state.get("diff_text", "")
-    
+
     if not raw_reviews:
         return {"final_reviews": [], "dropped_reviews": []}
-        
+
     # 1. Deterministic Checks
     # Simple line number check (rough diff parsing)
     import re
@@ -482,30 +526,30 @@ def critic_step(state: AgentState):
                 valid_lines.add(line_num)
             except:
                 pass
-                
+
     llm_candidates = []
     dropped = []
-    
+
     for review in raw_reviews:
         file_path = review.get("file", "")
         line_num = review.get("line", 0)
-        
+
         # Check 1: File existence
         if pr_filenames and not any(file_path.endswith(pr) for pr in pr_filenames):
             dropped.append({"finding": review, "reason": f"File {file_path} not in PR."})
             continue
-            
+
         # Check 2: Line existence
         if valid_lines and line_num not in valid_lines:
             dropped.append({"finding": review, "reason": f"Line {line_num} is not a valid modified line in diff."})
             continue
-            
+
         llm_candidates.append(review)
-        
+
     # 2. LLM Verification
     final_reviews = []
     if llm_candidates:
-        llm = init_llm().with_structured_output(CriticDecision)
+        llm = init_llm().bind(response_format={'type': 'json_object'})
         prompt = f"""You are a Critic Agent. Verify the following candidate code review findings.
 Drop a finding if:
 - It is purely a subjective style preference without evidence.
@@ -516,6 +560,25 @@ Candidate findings:
 {llm_candidates}
 
 Output which to keep and which to drop (with reasons).
+You MUST return ONLY a valid JSON object matching the following structure:
+""" + """{
+  "kept": [
+    {
+      "file": "string",
+      "line": 123,
+      "comment": "string",
+      "check": "string",
+      "evidence": "string | null",
+      "severity": "info | warning | error"
+    }
+  ],
+  "dropped": [
+    {
+      "finding": {},
+      "reason": "string"
+    }
+  ]
+}
 """
         try:
             decision: CriticDecision = llm.invoke([HumanMessage(content=prompt)])
@@ -526,39 +589,39 @@ Output which to keep and which to drop (with reasons).
             logger.error(f"Critic LLM failed: {e}")
             # Fallback: keep them all if critic fails
             final_reviews = llm_candidates
-            
+
     trace_event = {
         "node": "critic_step",
         "summary": f"Critic verified findings. Kept: {len(final_reviews)}, Dropped: {len(dropped)}",
         "data": {"dropped": [d.get("reason") for d in dropped]}
     }
-    
+
     return {
         "final_reviews": final_reviews,
         "dropped_reviews": dropped,
         "agent_trace": state.get("agent_trace", []) + [trace_event]
     }
 
+
 def finalize_review_step(state: AgentState):
     """LangGraph node: Formats trace and final comments."""
     logger.info("Executing finalize_review_step...")
     final_reviews = state.get("final_reviews", [])
     agent_trace = state.get("agent_trace", [])
-    
+
     # 1. Format legacy comments
-    final_comments = final_reviews # already list of dicts: file, line, comment
-    
+    final_comments = final_reviews  # already list of dicts: file, line, comment
+
     # 2. Format Trace Markdown
     trace_md = "<details>\n<summary>🤖 Agent Trace</summary>\n\n"
     for event in agent_trace:
         trace_md += f"- **{event.get('node')}**: {event.get('summary')}\n"
     trace_md += "\n</details>"
-    
+
     return {
         "final_comments": final_comments,
         "trace_markdown": trace_md
     }
-
 
 
 def build_review_graph() -> StateGraph:
@@ -568,7 +631,7 @@ def build_review_graph() -> StateGraph:
     workflow.add_node("reviewer", reviewer_step)
     workflow.add_node("critic", critic_step)
     workflow.add_node("finalize", finalize_review_step)
-    
+
     workflow.set_entry_point("planner")
     workflow.add_edge("planner", "retrieve")
     workflow.add_edge("retrieve", "reviewer")
@@ -577,22 +640,23 @@ def build_review_graph() -> StateGraph:
     workflow.add_edge("finalize", END)
     return workflow.compile()
 
+
 graph = build_review_graph()
 
 
 def global_impact_step(state: AgentState):
     """LangGraph node: Assesses cross-file backward compatibility using AST Tool Calling."""
     logger.info("Executing global_impact_step with AST Tool Calling...")
-    
+
     if not state.get("repo_path"):
         logger.info("No repo_path provided. Skipping AST Global Impact check.")
         return {"review_result": ""}
-        
+
     llm = init_llm()
     # Bind AST tools for the LLM
     from langchain_core.messages import HumanMessage, ToolMessage
     llm_with_tools = llm.bind_tools([find_python_references, read_code_snippet])
-    
+
     pr_filenames_str = ", ".join(state.get('pr_filenames', []))
     prompt = f"""你是一位具备全栈代码库视野的全局架构师。
 你的任务是评估本次 PR 修改是否引发了跨文件的**破坏性变更（Breaking Changes）**。
@@ -615,19 +679,19 @@ def global_impact_step(state: AgentState):
 
     messages = [HumanMessage(content=prompt)]
     tool_trace = []  # Collect AST execution steps for display in PR comment
-    
+
     try:
-        for _ in range(5): # Limit to 5 LLM interactions
+        for _ in range(5):  # Limit to 5 LLM interactions
             response = llm_with_tools.invoke(messages)
             messages.append(response)
-            
+
             if not response.tool_calls:
-                break # LLM decided to reply normally
-                
+                break  # LLM decided to reply normally
+
             for tool_call in response.tool_calls:
                 tool_name = tool_call["name"]
                 tool_args = tool_call["args"]
-                
+
                 try:
                     if tool_name == "find_python_references":
                         # Ensure repo_path is explicitly set to prevent LLM hallucinating paths
@@ -651,7 +715,7 @@ def global_impact_step(state: AgentState):
                 except Exception as e:
                     tool_result = f"Tool execution error: {e}"
                     tool_trace.append(f"❌ 工具执行失败: `{tool_name}` → {e}")
-                    
+
                 logger.info(f"[AST Agent] Executed {tool_name} -> {str(tool_result)[:100]}...")
                 messages.append(ToolMessage(content=str(tool_result), tool_call_id=tool_call["id"]))
 
@@ -663,12 +727,13 @@ def global_impact_step(state: AgentState):
         # Log the full AST trace for debugging, but don't expose it in the PR comment
         if tool_trace:
             logger.info("[AST Agent] Full reasoning trace:\n" + "\n".join(tool_trace))
-            
+
         return {"review_result": final_content}
-        
+
     except Exception as e:
         logger.error(f"Global impact tool execution error: {e}")
         return {"review_result": ""}
+
 
 global_graph = StateGraph(AgentState)
 global_graph.add_node("global_impact", global_impact_step)
@@ -676,7 +741,9 @@ global_graph.set_entry_point("global_impact")
 global_graph.add_edge("global_impact", END)
 global_impact_graph = global_graph.compile()
 
-def trigger_review_pipeline(pr_files_data: list[dict], tier: str = "Tier-B", review_context: str = "", review_focus: str = "", repo_path: str = "") -> dict:
+
+def trigger_review_pipeline(pr_files_data: list[dict], tier: str = "Tier-B", review_context: str = "",
+                            review_focus: str = "", repo_path: str = "") -> dict:
     """
     Executes Local Review Agents natively concurrently per-file.
     Optionally executes Global Impact Agent if tier mandates it.
@@ -685,11 +752,11 @@ def trigger_review_pipeline(pr_files_data: list[dict], tier: str = "Tier-B", rev
     logger.info(f"Triggering Multi-Agent Map-Reduce pipeline for {len(pr_files_data)} files...")
     if not pr_files_data:
         return {"comments": [], "global_warning": "", "agent_trace": [], "agent_trace_markdown": "", "plan": {}}
-        
+
     initial_states = []
     combined_diffs = ""
     pr_filenames = [fd["filename"] for fd in pr_files_data]
-    
+
     for file_data in pr_files_data:
         combined_diffs += f"\nFile: {file_data['filename']}\n{file_data['patch']}\n"
         state = {
@@ -706,28 +773,28 @@ def trigger_review_pipeline(pr_files_data: list[dict], tier: str = "Tier-B", rev
             "agent_trace": []
         }
         initial_states.append(state)
-        
+
     # 1. Parallel execution for Local File Reviewers
     results = graph.batch(initial_states)
-    
+
     all_reviews = []
     all_traces = []
     all_trace_mds = []
     final_plan = {}
-    
+
     for result in results:
         final_comments = result.get("final_comments", [])
         if final_comments:
             all_reviews.extend(final_comments)
-            
+
         agent_trace = result.get("agent_trace", [])
         if agent_trace:
             all_traces.extend(agent_trace)
-            
+
         trace_md = result.get("trace_markdown", "")
         if trace_md:
             all_trace_mds.append(f"### File: {result.get('filename')}\n{trace_md}")
-            
+
         # Just grab the plan from the first file as the general plan (since they run concurrently but use same metadata roughly)
         if not final_plan and result.get("plan"):
             final_plan = result.get("plan")
@@ -749,16 +816,17 @@ def trigger_review_pipeline(pr_files_data: list[dict], tier: str = "Tier-B", rev
         }
         res = global_impact_graph.invoke(gl_state)
         global_warning = res.get("review_result", "")
-        
+
     combined_trace_md = "\n\n".join(all_trace_mds)
-        
+
     return {
-        "comments": all_reviews, 
+        "comments": all_reviews,
         "global_warning": global_warning,
         "agent_trace": all_traces,
         "agent_trace_markdown": combined_trace_md,
         "plan": final_plan
     }
+
 
 def chat_step(state: AgentState):
     """LangGraph node: Answers developer questions about the code/review."""
@@ -777,6 +845,7 @@ def chat_step(state: AgentState):
         logger.error(f"LLM API Error during chat: {e}")
         return {"chat_response": f"LLM Connection Error: {str(e)}"}
 
+
 def build_chat_graph() -> StateGraph:
     workflow = StateGraph(AgentState)
     workflow.add_node("chat_node", chat_step)
@@ -784,7 +853,9 @@ def build_chat_graph() -> StateGraph:
     workflow.add_edge("chat_node", END)
     return workflow.compile()
 
+
 chat_graph = build_chat_graph()
+
 
 def trigger_chat_pipeline(diff_text: str, chat_query: str) -> str:
     state = {
@@ -800,6 +871,7 @@ def trigger_chat_pipeline(diff_text: str, chat_query: str) -> str:
     }
     result = chat_graph.invoke(state)
     return result.get("chat_response", "无法生成回答。")
+
 
 def trigger_refiner_pipeline(diff_text: str, user_comment: str) -> str:
     """
@@ -838,7 +910,7 @@ def trigger_refiner_pipeline(diff_text: str, user_comment: str) -> str:
         f"【开发者评论】:\n{user_comment}\n\n"
         f"请输出 JSON:"
     )
-    
+
     try:
         response = llm.invoke([HumanMessage(content=prompt)])
         raw_text = response.content.strip()
@@ -863,12 +935,12 @@ def trigger_refiner_pipeline(diff_text: str, user_comment: str) -> str:
 
                 confidence = parsed_json.get("confidence", 0.0)
                 risk = parsed_json.get("risk", "high")
-                
+
                 if confidence < 0.6 or risk == "high":
                     reason = parsed_json.get("reject_reason", "规则置信度过低或风险过高，已被自评拦截。")
                     logger.info(f"Refiner rejected rule. Confidence: {confidence}, Risk: {risk}. Reason: {reason}")
                     return f"❌ **提炼的规则未通过 AI 自评拦截**\n\n拦截原因: {reason}\n置信度: {confidence}"
-                
+
                 status = "production"
                 if confidence < 0.85 or risk == "medium":
                     status = "staging"
@@ -884,13 +956,13 @@ def trigger_refiner_pipeline(diff_text: str, user_comment: str) -> str:
                     "rule_action": parsed_json.get("rule_action", {}),
                     "created_at": datetime.datetime.utcnow().isoformat(),
                 }
-                
+
                 import uuid
                 rule_id = str(uuid.uuid4())
                 ingest_knowledge(content_to_save, metadata=metadata, rule_id=rule_id)
-                
+
                 rule_name = parsed_json.get("rule_action", {}).get("skill_name", "UNKNOWN")
-                
+
                 if status == "staging":
                     return (
                         f"📋 **该规则已进入审查暂存区（staging）**\n\n"
