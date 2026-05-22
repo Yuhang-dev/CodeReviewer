@@ -134,9 +134,10 @@ def init_qdrant() -> QdrantClient:
         )
     return client
 
-
+import threading
 _qdrant_client = None
 _embeddings_model = None
+_embeddings_lock = threading.Lock()
 
 def get_qdrant() -> QdrantClient:
     global _qdrant_client
@@ -147,7 +148,9 @@ def get_qdrant() -> QdrantClient:
 def get_embeddings():
     global _embeddings_model
     if _embeddings_model is None:
-        _embeddings_model = HuggingFaceEmbeddings(model_name="BAAI/bge-small-zh-v1.5")
+        with _embeddings_lock:
+            if _embeddings_model is None:
+                _embeddings_model = HuggingFaceEmbeddings(model_name="BAAI/bge-small-zh-v1.5")
     return _embeddings_model
 
 from app.core.llm import init_llm
@@ -542,7 +545,8 @@ def reviewer_step(state: AgentState):
     prompt = (
         f"你是一位资深工程师。请使用中文审查代码变更。\n"
         f"当前审查的文件名是：{state.get('filename')}\n"
-        f"要求：\n1. {tier_requirements}\n2. Diff 中每行以 L+数字 开头（如 L15），你必须使用该真实行号！\n3. 在 findings 的 file 字段中，必须严格填写 {state.get('filename')}！\n\n"
+        f"要求：\n1. {tier_requirements}\n2. Diff 中每行以 L+数字 开头（如 L15），你必须使用该真实行号！\n3. 在 findings 的 file 字段中，必须严格填写 {state.get('filename')}！\n"
+        f"4. 绝不要对描述测试场景的注释（Comment）或文档字符串（Docstring）提出审查意见！审查必须针对实际业务逻辑。\n\n"
         f"{context_str}\n"
         f"【完整文件上下文】:\n{state.get('full_files_context', '')}\n\n"
         f"【代码 Diff 变更】:\n{annotate_diff_with_line_numbers(diff_text)}\n\n"
@@ -633,7 +637,9 @@ def critic_step(state: AgentState):
         llm = init_llm().bind(response_format={'type': 'json_object'})
         prompt = f"""你是一个 Critic Agent (代码审查校验员)。请仔细验证以下生成的代码审查意见。
 你需要根据以下规则丢弃（Drop）不合理的意见：
-- 纯粹是主观的代码风格偏好，且没有提供有力的证据。
+- 纯粹是主观的代码风格偏好（如大小写、单双引号），且没有被纳入到企业规范中。
+- 试图纠正描述测试场景的文档字符串或注释（例如“注释说不该做但代码做了”，这是测试目的，绝对不要报出）。
+- 没有企业代码规范支撑，且不属于严重安全性、正确性或可靠性问题的“低风险文本建议”。
 - 提供的证据与评论内容不符或不足以支撑该评论。
 - 评论内容本身违背了最佳实践。
 
