@@ -1,0 +1,46 @@
+[
+  {
+    "content": "Never build SQL statements with f-strings, string concatenation, or format interpolation when values come from function arguments or external input. Use parameterized queries. This is especially critical for payment, wallet, order, and account balance code.",
+    "category": "sql-injection",
+    "language": "python",
+    "severity": "error",
+    "path_regex": ".*payment.*|.*wallet.*|.*order.*|test_scenarios/rag_case_01_sql_payment\\.py",
+    "source": "rag_test_seed",
+    "status": "production",
+    "rule_action": {}
+  },
+  {
+    "content": "Runtime code must not read and overwrite source files to change prompts, templates, or business logic. Store dynamic prompts in configuration, database records, or a dedicated template store. Directly rewriting source files creates race conditions, deployment drift, and supply-chain risk.",
+    "category": "runtime-source-mutation",
+    "language": "python",
+    "severity": "error",
+    "path_regex": "test_scenarios/rag_case_02_runtime_source_mutation\\.py|app/services/.*",
+    "source": "rag_test_seed",
+    "status": "production",
+    "rule_action": {}
+  },
+  {
+    "content": "For the legacy add helper in test scenarios, a single-argument add(x) implementation is allowed to return x + x. Do not flag this as a missing second argument or API misuse when the function docstring explicitly states the business allowance.",
+    "category": "business-allowance",
+    "language": "python",
+    "severity": "info",
+    "path_regex": "test_scenarios/rag_case_03_allowed_single_arg_add\\.py",
+    "source": "rag_test_seed",
+    "status": "production",
+    "rule_action": {
+      "action": "SOFTEN_FINDING",
+      "skill_name": "type_hints_check"
+    }
+  },
+  {
+    "content": "HTTP clients must set explicit timeouts and handle network exceptions when calling external services. Retry policies should be bounded and idempotency-aware.",
+    "category": "api-resilience",
+    "language": "python",
+    "severity": "warning",
+    "path_regex": "app/integrations/.*|test_scenarios/http_.*",
+    "source": "rag_test_seed",
+    "status": "production",
+    "rule_action": {}
+  }
+]
+
