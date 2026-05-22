@@ -636,6 +636,10 @@ def finalize_review_step(state: AgentState):
     trace_md = "<details>\n<summary>🤖 Agent Trace</summary>\n\n"
     for event in agent_trace:
         trace_md += f"- **{event.get('node')}**: {event.get('summary')}\n"
+        if event.get("node") == "critic_step" and "dropped" in event.get("data", {}):
+            for drop_reason in event["data"]["dropped"]:
+                if drop_reason:
+                    trace_md += f"  - 🚫 Dropped: {drop_reason}\n"
     trace_md += "\n</details>"
 
     return {
