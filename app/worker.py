@@ -62,10 +62,12 @@ def review_pipeline_job(repo_full_name: str, pr_number: int, commit_id: str, tie
         
         review_comments = result_data.get("comments", [])
         global_warning = result_data.get("global_warning", "")
+        agent_trace_md = result_data.get("agent_trace_markdown", "")
+        plan = result_data.get("plan", {})
         
-        if global_warning:
-            run_async(post_pr_comment(repo_full_name, pr_number, f"⚠️ **Global Impact Warning ( {tier} )** ⚠️\n\n{global_warning}"))
+        final_tier = plan.get("final_tier", tier)
         
+        # 1. Post Inline Comments
         inline_success = False
         if review_comments:
             # Fix path issues (remove a/ or b/ prefixes)
@@ -80,17 +82,28 @@ def review_pipeline_job(repo_full_name: str, pr_number: int, commit_id: str, tie
                 inline_success = True
             except Exception as review_err:
                 logger.error(f"Failed to post inline review, falling back to comment: {review_err}")
-                fallback_md = f"### AI Review Report ({tier})\n\n⚠️ **无法精确定位代码行，改用全局评论：**\n\n"
+                fallback_md = f"### AI Review Report ({final_tier})\n\n⚠️ **无法精确定位代码行，改用全局评论：**\n\n"
                 for c in review_comments:
                     fallback_md += f"- **{c.get('path', 'Unknown file')}** (Line {c.get('line', '?')}): {c.get('body', c.get('comment', ''))}\n"
                 run_async(post_pr_comment(repo_full_name, pr_number, fallback_md))
                 inline_success = True
                 
-        if inline_success:
-            return
+        # 2. Build PR-Level Summary
+        summary_md = ""
+        if global_warning:
+            summary_md += f"⚠️ **Global Impact Warning ( {final_tier} )** ⚠️\n\n{global_warning}\n\n---\n\n"
             
         if not review_comments:
-            run_async(post_pr_comment(repo_full_name, pr_number, f"AI Code Review completed ({tier}). LGTM! 👍"))
+            summary_md += f"AI Code Review completed ({final_tier}). LGTM! 👍\n\n"
+        else:
+            summary_md += f"AI Code Review completed ({final_tier}). See inline comments for details.\n\n"
+            
+        if agent_trace_md:
+            summary_md += agent_trace_md
+            
+        # 3. Post PR-Level Summary
+        if summary_md:
+            run_async(post_pr_comment(repo_full_name, pr_number, summary_md))
             
     except Exception as e:
         logger.error(f"Error executing review pipeline in Celery: {e}")
