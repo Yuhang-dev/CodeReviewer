@@ -475,7 +475,8 @@ def reviewer_step(state: AgentState):
 
     prompt = (
         f"你是一位资深工程师。请使用中文审查代码变更。\n"
-        f"要求：\n1. {tier_requirements}\n2. Diff 中每行以 L+数字 开头（如 L15），你必须使用该真实行号！\n\n"
+        f"当前审查的文件名是：{state.get('filename')}\n"
+        f"要求：\n1. {tier_requirements}\n2. Diff 中每行以 L+数字 开头（如 L15），你必须使用该真实行号！\n3. 在 findings 的 file 字段中，必须严格填写 {state.get('filename')}！\n\n"
         f"{context_str}\n"
         f"【完整文件上下文】:\n{state.get('full_files_context', '')}\n\n"
         f"【代码 Diff 变更】:\n{annotate_diff_with_line_numbers(diff_text)}\n\n"
