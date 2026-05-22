@@ -1,145 +1,247 @@
-# 🤖 Agentic RAG Code Reviewer
+# Agentic RAG Code Reviewer
 
-![Python](https://img.shields.io/badge/Python-3.10%2B-blue?style=for-the-badge&logo=python)
-![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-009688?style=for-the-badge&logo=fastapi)
-![Celery](https://img.shields.io/badge/Celery-5.3%2B-37814A?style=for-the-badge&logo=celery)
-![Redis](https://img.shields.io/badge/Redis-7.0-DC382D?style=for-the-badge&logo=redis)
-![Qdrant](https://img.shields.io/badge/Qdrant-Vector%20DB-FF5252?style=for-the-badge&logo=qdrant)
-![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?style=for-the-badge&logo=docker)
+一个面向 GitHub Pull Request 的多 Agent 代码审查原型系统。项目基于 FastAPI、Celery、Redis、Qdrant 和 LangGraph，将 PR Webhook 接入、异步任务处理、RAG 规范检索、风险分级、候选审查意见生成、Critic 过滤和审查轨迹展示串成完整流程。
 
-An **Enterprise-Grade, Agentic RAG-powered Code Review System**. This project leverages Large Language Models (LLMs) and Vector Databases to automatically review GitHub Pull Requests, provide context-aware suggestions, and maintain a self-evolving knowledge base of corporate coding guidelines.
+相比简单的 "把 diff 扔给 LLM" 的代码审查工具，本项目重点展示一个可解释的多 Agent 工作流：
 
-## ✨ Core Features & Architecture Highlights
+```text
+GitHub Webhook
+  -> Celery Review Job
+  -> Planner
+  -> Retriever
+  -> Reviewer
+  -> Critic
+  -> Finalizer
+  -> GitHub Inline Comments + PR Trace Summary
+```
 
-- ⚡ **Zero-Drop Asynchronous Queue**: Built on **Celery + Redis**, completely decoupling the GitHub Webhook (FastAPI) from heavy LLM inference. Eliminates GitHub's 10-second timeout constraints and ensures tasks survive container restarts (Robust Chaos Engineering).
-- 🐳 **One-Click Containerization**: Fully orchestrated via `docker-compose`. Includes Web API, Celery Worker, Redis Message Broker, and Qdrant DB.
-- 🔒 **Privacy & Offline Support**: Uses local HuggingFace Embedding models (`BAAI/bge-small-zh-v1.5`) with physical cache mounting (`HF_HUB_OFFLINE=1`). Embeddings are calculated strictly on-premise without network tracking.
-- 🔍 **AST‑Based Global Impact Analysis** – Detects cross‑file breaking changes; detailed reasoning is logged internally (worker logs) and not exposed in PR comments.
+## Features
 
----
+- **异步 PR 审查流水线**：FastAPI 接收 GitHub Webhook 后将任务交给 Celery Worker，避免在 Webhook 请求中执行重型 LLM/RAG 逻辑。
+- **Planner Agent 风险分级**：根据用户声明的 Tier 和 diff 内容推断最终审查等级。系统尊重用户设置，但当代码涉及鉴权、支付、SQL、运行时改源码等高风险场景时会自动升档。
+- **Tier Resolver 策略**：最终等级采用 `max(user_requested_tier, system_inferred_tier)`，只允许系统升档，不自动降档，避免忽略 PR 作者的业务上下文。
+- **RAG 规范检索**：使用 Qdrant 存储团队代码规范、历史误报修正规则和上下文补丁，并结合本地 HuggingFace embedding 进行检索。
+- **Reviewer Agent 候选意见生成**：结合 diff、完整文件上下文、检索到的规范和静态检查结果，生成结构化候选 finding。
+- **Critic Agent 误报过滤**：对候选意见进行二次校验，过滤缺少证据、行号不可靠、主观风格偏好或重复的评论。
+- **Agent Trace 可观测性**：每个文件的 Planner、Retriever、Reviewer、Critic 结果会被格式化为 PR 级别 trace，方便调试和展示系统决策路径。
+- **Human-in-the-loop 反馈入口**：支持通过 PR 评论触发普通对话或误报反馈流程，将有效误报原因沉淀为后续检索记忆。
 
-## 💡 Advanced Usage & Agentic Workflows
+## Architecture
 
-This system is not a simple "prompt-in, prompt-out" wrapper. It implements a multi-agent orchestrated workflow using LangGraph concepts.
+系统由四类主要组件组成：
 
-### 1. 🚦 Multi-Tier Routing (Tier-X)
+1. **Gateway API**
+   FastAPI 负责接收 GitHub Webhook、校验签名、解析事件和 PR metadata，并将 review 任务交给 Celery。
 
-To prevent wasting high-cost LLM tokens on trivial changes, the system supports dynamic routing based on PR metadata. Developers can control the depth of the review by adding a metadata block to their PR description:
+2. **Async Worker**
+   Celery Worker 负责拉取 PR 文件、调用多 Agent 审查流程、提交 inline review，并发布 PR 级别 summary。
+
+3. **Agentic Review Pipeline**
+   LangGraph 编排 `planner -> retrieve -> reviewer -> critic -> finalize`。节点之间通过结构化 state 传递计划、规范、候选意见、最终意见和 trace。
+
+4. **Memory / Knowledge Base**
+   Qdrant 存储代码规范和误报修正规则。本地 embedding 模型用于将 diff 意图和规范文本映射到同一语义空间。
+
+```mermaid
+graph TD
+    GitHub[GitHub PR Webhook] --> API[FastAPI Gateway]
+    API --> Redis[(Redis Broker)]
+    Redis --> Worker[Celery Worker]
+    Worker --> Planner[Planner Agent]
+    Planner --> Retriever[Retriever]
+    Retriever <--> Qdrant[(Qdrant Knowledge Base)]
+    Retriever --> Reviewer[Reviewer Agent]
+    Reviewer --> Critic[Critic Agent]
+    Critic --> Finalizer[Finalizer]
+    Finalizer --> GitHubComments[GitHub Inline Comments]
+    Finalizer --> Trace[PR Agent Trace Summary]
+```
+
+## Multi-Agent Workflow
+
+### 1. Planner
+
+Planner 读取 PR metadata、diff 内容和文件信息，输出结构化计划：
+
+```json
+{
+  "user_requested_tier": "Tier-A",
+  "system_inferred_tier": "Tier-S",
+  "final_tier": "Tier-S",
+  "risk_reasons": ["Detected payment or SQL mutation logic"],
+  "selected_checks": ["security", "idempotency", "api_resilience"]
+}
+```
+
+核心策略：
+
+- 用户请求高 Tier 时，系统不会自动降档。
+- 系统识别到更高风险时会自动升档。
+- `final_tier` 会影响后续是否启用深度语义检查、AST 全局影响分析和更严格的 Critic 过滤。
+
+### 2. Retriever
+
+Retriever 根据文件语言、风险计划和 diff 意图检索相关规范，并返回：
+
+- 匹配到的团队规范
+- 历史误报补丁
+- 需要禁用或弱化的检查项
+
+### 3. Reviewer
+
+Reviewer 生成结构化候选 finding，而不是直接输出 GitHub 评论：
+
+```json
+{
+  "file": "test_scenarios/test_tier_upgrade.py",
+  "line": 12,
+  "comment": "直接使用 f-string 拼接 user_id 和 amount 构造 SQL，存在 SQL 注入风险，应改为参数化查询。",
+  "check": "security",
+  "evidence": "UPDATE user_wallets SET balance = balance - {amount} WHERE user_id = {user_id}",
+  "severity": "error"
+}
+```
+
+### 4. Critic
+
+Critic 对候选 finding 做二次验证：
+
+- 行号是否出现在新文件侧 diff 中
+- 文件是否属于当前 PR
+- finding 是否有具体 evidence
+- 是否只是主观风格建议
+- 是否与检索到的规范或 selected check 有关
+- 是否与其他 finding 重复
+
+Critic 会输出保留和丢弃的结果，并将丢弃原因写入 Agent Trace。
+
+### 5. Finalizer
+
+Finalizer 将保留的 finding 转换为 GitHub inline review comment，同时生成 PR 级别的 trace summary。
+
+## Example PR Behavior
+
+一个测试 PR 中包含三个文件：
+
+- `test_rule_allowance.py`：业务允许的特殊规则场景
+- `test_rule_violation.py`：运行时读取并覆盖源码文件
+- `test_tier_upgrade.py`：支付扣款逻辑中存在 SQL 拼接和事务风险
+
+系统表现：
+
+- 对普通允许场景保持较低风险等级。
+- 对运行时修改源码的场景升档到 `Tier-S`。
+- 对支付/SQL 场景升档到 `Tier-S`。
+- Reviewer 生成候选意见后，Critic 会丢弃证据不足或偏主观的评论。
+- PR 页面会同时包含 inline comments 和一条 Agent Trace summary。
+
+## API And Interaction
+
+### GitHub Webhook
+
+```text
+POST /webhook/github
+```
+
+处理 GitHub `pull_request`、`issue_comment` 和 `pull_request_review_comment` 事件。
+
+### Knowledge Ingestion
+
+```text
+POST /knowledge/ingest
+```
+
+将团队规范或特殊业务规则写入 Qdrant。
+
+### PR Metadata
+
+开发者可以在 PR 描述中声明审查等级：
+
+```text
+>>>Tier-A<<<
+```
+
+也可以使用更完整的 metadata：
 
 ```text
 >>>REVIEW_METADATA<<<
-Tier: Tier-S
-Context: Implement core payment transaction lock.
-Focus: Race conditions, deadlock prevention, ACID compliance.
+Tier: Tier-A
+Context: Payment callback refactor.
+Focus: SQL injection, transaction consistency, idempotency.
 >>>END<<<
 ```
 
-- **Tier-S (Deep Architecture)**: Triggers deep file-tree scanning and strict architectural compliance checks.
-- **Tier-A (Standard)**: Thorough logical review.
-- **Tier-B (Fast-Path)**: Lightweight syntax, style, and obvious bug checks (Default).
+## Quick Start
 
-### 2. 💬 Interactive Refiner & Human-in-the-Loop (`@bot`)
+### 1. Prepare Environment
 
-If the AI suggests a modification but you want a different approach, or if you need the AI to elaborate, simply reply to the PR comment:
-> `@bot please rewrite this using a switch-case statement instead.`
-
-The **Chat Pipeline** will instantly trigger, read the conversation history, and generate a newly revised code snippet in the thread.
-
-### 3. 🛡️ False Positive Handling & Agentic Self-Correction
-
-Code review bots are notorious for generating noisy, false-positive comments. This system implements an **Agentic Critic mechanism**:
-
-1. **Draft Generation**: The primary Reviewer Agent drafts comments based on the code diff.
-2. **Critic Evaluation**: A secondary Critic Agent evaluates the draft against corporate guidelines retrieved from Qdrant.
-3. **Self-Correction**: If the Critic flags a comment as trivial, hallucinatory, or a "false positive" (e.g., complaining about a missing import that exists in another file), the comment is automatically dropped before it ever reaches GitHub.
-
-### 4. 🧠 Dynamic Knowledge Injection (Advanced RAG 2.0)
-
-Our RAG implementation goes far beyond naive chunk-and-search vector retrieval. It implements a **Hybrid Retrieval** architecture to bridge the semantic gap between code diffs and natural language:
-
-- **Query Rewriting (HyDE Variant)**: Direct vector matching between code symbols (`+ import os`) and natural language rules often fails due to the semantic gap. We use an LLM to dynamically translate code diffs into "intent descriptions" before querying Qdrant, drastically improving recall accuracy.
-- **Structured Metadata Schema**: Every guideline injected into Qdrant is tagged with a strict schema (`category`, `language`, `path_regex`, `severity`). The retrieval process uses Qdrant's `QueryFilter` to perform hard-filtering (e.g., Python rules will never pollute Go file reviews).
-- **Two-Phase Refiner Pipeline**: When a developer rejects an AI comment via the GitHub thread (`@bot this is a false positive`), the system triggers a two-phase pipeline:
-  1. **Intent Classification**: Determines if the comment is a true "False Positive Rejection" or just "General Chat", preventing conversational garbage from polluting the vector DB.
-  2. **Conditional Extraction**: If classified as a false positive, it extracts the domain context and injects a `staging_patch` into Qdrant. Future PRs will pull this patch, effectively granting the system a self-healing memory.
----
-
-## 🏗️ System Architecture
-
-The system consists of 4 isolated Docker containers communicating via a dedicated Docker network:
-
-1. **Gateway Node (FastAPI)**: Lightweight webhook listener. Validates GitHub HMAC signatures, parses PR payloads, and enqueues tasks.
-2. **Message Broker (Redis)**: High-performance memory buffer. Absorbs traffic spikes and guarantees task delivery.
-3. **Compute Node (Celery Worker)**: The heavy lifter. Downloads diffs, queries the vector database, prompts the LLM, and posts review comments back to GitHub.
-4. **Memory Node (Qdrant)**: Persistent vector storage for corporate knowledge and developer guidelines.
-
-```mermaid
-graph TD;
-    GitHub[GitHub Webhook] -->|Push/PR Event| API[FastAPI Gateway]
-    API -->|Enqueue Task| Redis[(Redis Broker)]
-    API -.->|Return 200 OK| GitHub
-    Redis -->|Consume Task| Worker[Celery Worker]
-    Worker <-->|RAG Query/Upsert| Qdrant[(Qdrant Vector DB)]
-    Worker <-->|Embedding| LocalHF[Local HuggingFace Model]
-    Worker <-->|Inference & Agentic Critic| LLM[DeepSeek/OpenAI LLM]
-    Worker -->|Post Review| GitHub
-```
-
----
-
-## 🚀 Quick Start
-
-### 1. Prerequisites
-
-- Docker & Docker Compose
-- A GitHub repository with Webhooks enabled
-- DeepSeek / OpenAI API Key
-
-### 2. Environment Setup
-
-Create a `.env` file in the root directory:
+创建 `.env` 文件：
 
 ```env
-# GitHub Auth
-GITHUB_TOKEN=ghp_your_classic_repo_token_here
-GITHUB_WEBHOOK_SECRET=your_secret_string
+GITHUB_TOKEN=your_github_token
+GITHUB_WEBHOOK_SECRET=your_webhook_secret
 
-# LLM Configuration
-DEEPSEEK_API_KEY=sk-your_api_key
+DEEPSEEK_API_KEY=your_deepseek_key
 DEEPSEEK_BASE_URL=https://api.deepseek.com/v1
 
-# Component URLs (Internal Docker Network)
 QDRANT_URL=http://qdrant:6333
-REDIS_URL=redis://redis:6379/0
+CELERY_BROKER_URL=redis://redis:6379/0
+CELERY_RESULT_BACKEND=redis://redis:6379/0
 ```
 
-### 3. Deploy Infrastructure
+不要将真实 `.env` 提交到仓库。建议额外维护 `.env.example`。
 
-Run the following command to build the images and start the distributed system:
+### 2. Start Services
 
 ```bash
 docker-compose up -d --build
 ```
 
-### 4. Verify Services
-
-You can verify the robust architecture by inspecting the container logs:
+### 3. Check Logs
 
 ```bash
-# Watch the Gateway receive instant webhooks
 docker logs code_reviewer_api -f
-
-# Watch the Worker execute AI inference asynchronously
 docker logs code_reviewer_worker -f
 ```
 
----
+## Project Structure
 
-## 🔧 Technical Implementations (For Interviewers)
+```text
+app/
+  api/routes/
+    webhook.py       # GitHub webhook entry
+    knowledge.py     # Knowledge ingestion API
+  core/
+    config.py        # Environment settings
+    llm.py           # LLM client initialization
+  services/
+    github.py        # GitHub API integration
+    rag.py           # LangGraph multi-agent review pipeline
+  skills/
+    ast_tools.py
+    hardcoded_secrets_check.py
+    idempotency_check.py
+    api_resilience_check.py
+    print_statement_check.py
+    type_hints_check.py
+worker.py            # Celery app and task definitions
+docker-compose.yml   # API, Worker, Redis, Qdrant
+```
 
-- **Proxy & TLS MITM Resilience**: Configured `httpx.AsyncClient(verify=False)` and `HF_HUB_OFFLINE=1` to ensure the system survives enterprise VPN environments and TLS interception without crashing.
-- **Cache Persistence**: Deep learning model weights (`bge-small-zh`) are mounted natively from the host to the container via `volumes`, reducing initialization time from minutes to milliseconds.
-- **Graceful Error Handling**: Implemented multi-layered exception mapping for `httpx.ConnectError` and GitHub API rate-limiting, ensuring the background worker gracefully retries failed submissions.
+## Current Limitations
 
----
-*Built with ❤️ for next-generation developer productivity.*
+这个项目仍是原型系统，当前重点是展示多 Agent 审查链路和可解释流程，而不是完整生产级代码审查平台。
+
+已知改进方向：
+
+- 进一步降低噪音：合并同函数、同根因、相邻行号的重复评论。
+- Global Impact 节点改为结构化输出，仅在 `has_warning=true` 时发布 warning。
+- Critic 的 dropped reason 需要进一步产品化，避免暴露模型推理式表达。
+- 增加 pytest 覆盖 Tier Resolver、Critic 过滤、diff 行号映射和 RAG metadata 读写。
+- 为 Celery 增加 retry、任务幂等 key、超时控制和失败告警。
+- 增加 CI，覆盖 lint、type check、unit tests 和 Docker build。
+
+## Resume-Friendly Summary
+
+基于 FastAPI、Celery、Redis、Qdrant 和 LangGraph 独立实现 GitHub PR 多 Agent 自动审查原型。系统通过 Planner Agent 结合用户声明和 diff 风险自动解析最终审查等级，通过 RAG Retriever 注入团队规范，通过 Reviewer Agent 生成结构化候选意见，并由 Critic Agent 过滤误报和低证据评论，最终以 GitHub inline comment 和 Agent Trace 的形式输出可解释审查结果。
+
