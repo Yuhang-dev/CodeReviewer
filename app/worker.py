@@ -5,6 +5,11 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
+# 故意在某个函数里加一行未定义的变量或者明显的异常
+def some_func():
+    print(undefined_variable)
+    eval(request.body)  # 注入漏洞
+
 celery_app = Celery(
     "code_reviewer_tasks",
     broker=settings.CELERY_BROKER_URL,
