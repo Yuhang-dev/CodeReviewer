@@ -98,10 +98,10 @@ def review_pipeline_job(repo_full_name: str, pr_number: int, commit_id: str, tie
         if global_warning:
             summary_md += f"⚠️ **Global Impact Warning ( {final_tier} )** ⚠️\n\n{global_warning}\n\n---\n\n"
             
-        if not review_comments:
-            summary_md += f"AI Code Review completed ({final_tier}). LGTM! 👍\n\n"
+        if inline_success:
+            summary_md += f"AI 代码审查完毕 ({final_tier})。详见行内评论细节。\n\n"
         else:
-            summary_md += f"AI Code Review completed ({final_tier}). See inline comments for details.\n\n"
+            summary_md += f"AI 代码审查完毕 ({final_tier})。未发现明显问题！👍\n\n"
             
         if agent_trace_md:
             summary_md += agent_trace_md
