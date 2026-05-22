@@ -14,6 +14,9 @@ class Settings(BaseSettings):
     # Qdrant settings
     QDRANT_URL: str = "http://localhost:6333"
     QDRANT_API_KEY: str = ""
+    RAG_SCORE_THRESHOLD: float = 0.45
+    RAG_TOP_K: int = 5
+    RAG_CANDIDATE_LIMIT: int = 20
 
     # Celery / Redis settings
     CELERY_BROKER_URL: str = "redis://localhost:6379/0"

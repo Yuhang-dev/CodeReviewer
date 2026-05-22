@@ -50,11 +50,23 @@ class PlannerOutput(BaseModel):
 
 
 class RetrievedGuideline(BaseModel):
+    rule_id: str
     content: str
+    score: float
+    type: str = "guideline"
     category: str = "general"
     language: str = "all"
-    severity: str = "warning"
+    severity: Literal["info", "warning", "error"] = "warning"
+    path_regex: str = ".*"
     source: str = "qdrant"
+    status: Literal["staging", "production", "disabled"] = "production"
+    rule_action: dict = {}
+
+CHECK_TO_CATEGORIES = {
+    "security": ["security", "sql-injection", "secrets", "auth"],
+    "idempotency": ["idempotency", "transaction", "payment"],
+    "api_resilience": ["api-resilience", "timeout", "retry"],
+}
 
 
 class ReviewFinding(BaseModel):
@@ -123,10 +135,20 @@ def init_qdrant() -> QdrantClient:
     return client
 
 
-# Singleton clients
-qdrant_client = init_qdrant()
-# Fast, local, private embeddings
-embeddings_model = HuggingFaceEmbeddings(model_name="BAAI/bge-small-zh-v1.5")
+_qdrant_client = None
+_embeddings_model = None
+
+def get_qdrant() -> QdrantClient:
+    global _qdrant_client
+    if _qdrant_client is None:
+        _qdrant_client = init_qdrant()
+    return _qdrant_client
+
+def get_embeddings():
+    global _embeddings_model
+    if _embeddings_model is None:
+        _embeddings_model = HuggingFaceEmbeddings(model_name="BAAI/bge-small-zh-v1.5")
+    return _embeddings_model
 
 from app.core.llm import init_llm
 from app.skills.ast_tools import find_python_references, read_code_snippet
@@ -139,7 +161,9 @@ def ingest_knowledge(
         path_regex: str = ".*",
         language: str = "python",
         severity: str = "warning",
-        rule_id: str = None
+        rule_id: str = None,
+        status: str = "production",
+        rule_action: dict = None
 ) -> list[str]:
     """
     Chunks the input markdown text, generates embeddings, and saves to Qdrant.
@@ -154,7 +178,7 @@ def ingest_knowledge(
         return 0
 
     # Embed and upsert
-    vectors = embeddings_model.embed_documents(chunks)
+    vectors = get_embeddings().embed_documents(chunks)
 
     import uuid, datetime
     base_metadata = {
@@ -164,6 +188,8 @@ def ingest_knowledge(
         "language": language,
         "severity": severity,
         "source": "manual_ingest",
+        "status": status,
+        "rule_action": rule_action or {},
         "created_at": datetime.datetime.utcnow().isoformat(),
         **(metadata or {}),
     }
@@ -171,7 +197,7 @@ def ingest_knowledge(
     payloads = [{"content": chunk, **base_metadata} for chunk in chunks]
     ids = [rule_id] if rule_id and len(chunks) == 1 else [str(uuid.uuid4()) for _ in chunks]
 
-    qdrant_client.upsert(
+    get_qdrant().upsert(
         collection_name=COLLECTION_NAME,
         points=[
             {"id": id_, "vector": vector, "payload": payload}
@@ -187,7 +213,7 @@ def approve_knowledge_rule(rule_id: str) -> bool:
     """Approve a staging rule by moving it to production status."""
     try:
         from qdrant_client.models import SetPayloadOperation
-        qdrant_client.set_payload(
+        get_qdrant().set_payload(
             collection_name=COLLECTION_NAME,
             payload={"status": "production"},
             points=[rule_id]
@@ -202,7 +228,7 @@ def approve_knowledge_rule(rule_id: str) -> bool:
 def delete_knowledge_rule(rule_id: str) -> bool:
     """Delete a knowledge rule by ID."""
     try:
-        qdrant_client.delete(
+        get_qdrant().delete(
             collection_name=COLLECTION_NAME,
             points_selector=[rule_id]
         )
@@ -239,27 +265,37 @@ def _rewrite_diff_to_intent(diff_text: str) -> str:
         return diff_text
 
 
-def retrieve_guidelines(query_text: str, filename: str = "", language: str = "python") -> tuple[str, list[str]]:
+def retrieve_guidelines(query_text: str, filename: str = "", language: str = "python", categories: list[str] = None) -> tuple[list[dict], list[str]]:
     """
     Search Qdrant for relevant coding standards and staging patches.
-    Returns: (formatted guidelines string, list of disabled skill names)
+    Returns: (list of guideline dicts, list of disabled skill names)
     """
     try:
+        # Map logical checks to Qdrant categories
+        mapped_categories = []
+        if categories:
+            for cat in categories:
+                mapped_categories.extend(CHECK_TO_CATEGORIES.get(cat, [cat]))
+        # Deduplicate
+        mapped_categories = list(set(mapped_categories))
+
         human_readable_query = _rewrite_diff_to_intent(query_text)
-        query_vector = embeddings_model.embed_query(human_readable_query)
+        query_vector = get_embeddings().embed_query(human_readable_query)
 
         from qdrant_client.models import Filter, FieldCondition, MatchAny
-        lang_filter = Filter(
-            should=[
-                FieldCondition(key="language", match=MatchAny(any=[language, "all"])),
-            ]
-        ) if language else None
+        should_filters = []
+        if language:
+            should_filters.append(FieldCondition(key="language", match=MatchAny(any=[language, "all"])))
+        if mapped_categories:
+            should_filters.append(FieldCondition(key="category", match=MatchAny(any=mapped_categories)))
+            
+        qdrant_filter = Filter(should=should_filters) if should_filters else None
 
-        search_result = qdrant_client.query_points(
+        search_result = get_qdrant().query_points(
             collection_name=COLLECTION_NAME,
             query=query_vector,
-            query_filter=lang_filter,
-            limit=5
+            query_filter=qdrant_filter,
+            limit=getattr(settings, "RAG_CANDIDATE_LIMIT", 20)
         ).points
 
         guidelines = []
@@ -267,38 +303,64 @@ def retrieve_guidelines(query_text: str, filename: str = "", language: str = "py
         import re
 
         for hit in search_result:
+            if hit.score < getattr(settings, "RAG_SCORE_THRESHOLD", 0.45):
+                continue
+
+            status = hit.payload.get("status", "production")
+            if status in ["rejected", "disabled"]:
+                continue
+
             content = hit.payload.get("content", "")
-            metadata = hit.payload.get("metadata", {})
-
-            # Metadata-driven Action Routine
-            if metadata.get("type") == "staging_patch":
-                path_regex = metadata.get("path_regex", ".*")
-                if filename and not re.search(path_regex, filename):
-                    # Hard filtering: if the staging patch scope doesn't match the current file, skip it completely
-                    logger.info(f"Filtered out staging patch due to path mismatch: {path_regex} for {filename}")
+            
+            # Post-filtering by path_regex
+            path_regex = hit.payload.get("path_regex", ".*")
+            if path_regex and path_regex != ".*" and filename:
+                try:
+                    if not re.search(path_regex, filename):
+                        continue
+                except re.error:
+                    logger.warning(f"Invalid regex in rule {hit.id}: {path_regex}")
                     continue
-                status = metadata.get("status", "production")
 
-                # If matched, apply the patch text
-                if status == "staging":
-                    guidelines.append(f"【待审批规则 - 仅供参考】: {content}")
-                else:
-                    guidelines.append(f"【自愈纠偏补丁】: {content}")
-
-                # Suppress the skill via Route Action
-                action = metadata.get("rule_action", {}).get("action")
-                skill_name = metadata.get("rule_action", {}).get("skill_name")
-                if action == "DISABLE_SKILL" and skill_name:
-                    disabled_skills.append(skill_name)
-                    logger.info(f"Metadata routing payload triggered: Disabling skill [{skill_name}] for {filename}")
+            if status == "staging":
+                formatted_content = f"【待审批规则 - 仅供参考】: {content}"
+            elif hit.payload.get("type") == "staging_patch":
+                formatted_content = f"【自愈纠偏补丁】: {content}"
             else:
-                # Ordinary enterprise guidelines
-                guidelines.append(content)
+                formatted_content = content
+                
+            rule_obj = RetrievedGuideline(
+                rule_id=str(hit.id),
+                content=formatted_content,
+                score=hit.score,
+                type=hit.payload.get("type", "guideline"),
+                category=hit.payload.get("category", "general"),
+                language=hit.payload.get("language", "all"),
+                severity=hit.payload.get("severity", "warning"),
+                path_regex=path_regex,
+                source=hit.payload.get("source", "qdrant"),
+                status=status,
+                rule_action=hit.payload.get("rule_action", {})
+            )
+            guidelines.append(rule_obj.model_dump())
 
-        return "\n\n".join(guidelines), disabled_skills
+            # Metadata routing action (Only if production!)
+            if status == "production":
+                rule_action = rule_obj.rule_action
+                if isinstance(rule_action, dict):
+                    action = rule_action.get("action")
+                    skill_name = rule_action.get("skill_name")
+                    if action == "DISABLE_SKILL" and skill_name:
+                        disabled_skills.append(skill_name)
+                        logger.info(f"Metadata routing payload triggered: Disabling skill [{skill_name}] for {filename}")
+
+            if len(guidelines) >= getattr(settings, "RAG_TOP_K", 5):
+                break
+
+        return guidelines, disabled_skills
     except Exception as e:
         logger.error(f"Vector search failed: {e}")
-        return "", []
+        return [], []
 
 
 TIER_RANK = {
@@ -406,25 +468,29 @@ def retrieve_step(state: AgentState):
     language = state.get("language", "python")
     diff_text = state.get("diff_text", "")
 
-    # We use the existing retrieve_guidelines but adapt it to return structured data if needed.
-    # For now, we wrap it to match the new state requirements.
-    retrieved_context_str, disabled_skills = retrieve_guidelines(diff_text, filename, language)
+    plan = state.get("plan", {})
+    selected_categories = plan.get("selected_checks", []) if isinstance(plan, dict) else getattr(plan, "selected_checks", [])
+    
+    guidelines, disabled_skills = retrieve_guidelines(
+        query_text=diff_text, 
+        filename=filename, 
+        language=language, 
+        categories=selected_categories
+    )
 
-    # Mocking structure since existing retrieve_guidelines returns a string
-    guidelines = []
-    if retrieved_context_str.strip():
-        guidelines.append({
-            "content": retrieved_context_str,
-            "category": "general",
-            "language": language,
-            "severity": "warning",
-            "source": "qdrant"
-        })
+    if guidelines:
+        summary_str = f"检索到了 {len(guidelines)} 条相关规范：\n"
+        for g in guidelines:
+            summary_str += f"- [{g.get('category')}] score={g.get('score'):.2f} severity={g.get('severity')} source={g.get('source')}\n"
+        if disabled_skills:
+            summary_str += f"\n已禁用技能: {disabled_skills}"
+    else:
+        summary_str = "未检索到相关的企业规范。"
 
     trace_event = {
         "node": "retrieve_step",
-        "summary": f"检索到企业规范。已禁用技能: {disabled_skills}",
-        "data": {"disabled_skills": disabled_skills}
+        "summary": summary_str,
+        "data": {"guidelines_count": len(guidelines), "disabled_skills": disabled_skills}
     }
 
     return {
