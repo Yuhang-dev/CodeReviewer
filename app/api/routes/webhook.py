@@ -91,6 +91,11 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
                 focus_match = re.search(r'Focus:\s*(.*?)(?=\n(?:Tier|Context):|$)', meta_text, re.IGNORECASE | re.DOTALL)
                 if focus_match:
                     review_focus = focus_match.group(1).strip()
+            
+            # Also support standalone tier tags like >>>Tier-C<<<
+            standalone_tier_match = re.search(r'>>>(Tier-[SABC])<<<', pr_body, re.IGNORECASE)
+            if standalone_tier_match:
+                tier = standalone_tier_match.group(1).upper()
                     
             logger.info(f"Metadata parsed - Tier: {tier}, Focus: {review_focus}")
             
@@ -195,6 +200,11 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
                     focus_match = re.search(r'Focus:\s*(.*?)(?=\n(?:Tier|Context):|$)', meta_text, re.IGNORECASE | re.DOTALL)
                     if focus_match:
                         review_focus = focus_match.group(1).strip()
+
+                # Also support standalone tier tags like >>>Tier-C<<<
+                standalone_tier_match = re.search(r'>>>(Tier-[SABC])<<<', pr_body, re.IGNORECASE)
+                if standalone_tier_match:
+                    tier = standalone_tier_match.group(1).upper()
 
                 base_branch = payload["pull_request"]["base"]["ref"] if "pull_request" in payload else "master"
                 
