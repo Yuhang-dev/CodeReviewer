@@ -136,13 +136,16 @@ def init_qdrant() -> QdrantClient:
 
 import threading
 _qdrant_client = None
+_qdrant_lock = threading.Lock()
 _embeddings_model = None
 _embeddings_lock = threading.Lock()
 
 def get_qdrant() -> QdrantClient:
     global _qdrant_client
     if _qdrant_client is None:
-        _qdrant_client = init_qdrant()
+        with _qdrant_lock:
+            if _qdrant_client is None:
+                _qdrant_client = init_qdrant()
     return _qdrant_client
 
 def get_embeddings():
@@ -436,6 +439,18 @@ You MUST return ONLY a valid JSON object matching the following structure:
         elif raw_text.startswith("```"): raw_text = raw_text[3:-3].strip()
         plan_dict = json.loads(raw_text)
         plan = PlannerOutput(**plan_dict)
+
+        def normalize_tier(t: str) -> str:
+            if not t: return "Tier-B"
+            parts = t.strip().upper().split('-')
+            if len(parts) == 2 and parts[0] == 'TIER':
+                return f"Tier-{parts[-1]}"
+            if len(parts) == 1 and parts[0] in ['S', 'A', 'B', 'C']:
+                return f"Tier-{parts[0]}"
+            return t
+
+        plan.final_tier = normalize_tier(plan.final_tier)
+        plan.system_inferred_tier = normalize_tier(plan.system_inferred_tier)
         plan_dict = plan.dict()
 
         trace_event = {
@@ -901,6 +916,16 @@ def trigger_review_pipeline(pr_files_data: list[dict], tier: str = "Tier-B", rev
         # Just grab the plan from the first file as the general plan (since they run concurrently but use same metadata roughly)
         if not final_plan and result.get("plan"):
             final_plan = result.get("plan")
+            
+    # Compute highest tier across all files
+    highest_tier = tier
+    for result in results:
+        p = result.get("plan", {})
+        if p and p.get("final_tier"):
+            highest_tier = higher_tier(highest_tier, p.get("final_tier"))
+            
+    if final_plan:
+        final_plan["final_tier"] = highest_tier
 
     # 2. Sequential/Parallel Global Impact Analyzer (if tier allows)
     global_warning = ""
