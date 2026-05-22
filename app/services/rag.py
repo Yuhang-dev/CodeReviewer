@@ -364,7 +364,13 @@ You MUST return ONLY a valid JSON object matching the following structure:
 }
 """
     try:
-        plan: PlannerOutput = llm.invoke([HumanMessage(content=prompt)])
+        response = llm.invoke([HumanMessage(content=prompt)])
+        import json
+        raw_text = response.content.strip()
+        if raw_text.startswith("```json"): raw_text = raw_text[7:-3].strip()
+        elif raw_text.startswith("```"): raw_text = raw_text[3:-3].strip()
+        plan_dict = json.loads(raw_text)
+        plan = PlannerOutput(**plan_dict)
         plan_dict = plan.dict()
 
         trace_event = {
@@ -489,8 +495,14 @@ def reviewer_step(state: AgentState):
     )
 
     try:
-        response: ReviewerOutput = llm.invoke([HumanMessage(content=prompt)])
-        raw_reviews = [f.dict() for f in response.findings]
+        response = llm.invoke([HumanMessage(content=prompt)])
+        import json
+        raw_text = response.content.strip()
+        if raw_text.startswith("```json"): raw_text = raw_text[7:-3].strip()
+        elif raw_text.startswith("```"): raw_text = raw_text[3:-3].strip()
+        resp_dict = json.loads(raw_text)
+        resp_obj = ReviewerOutput(**resp_dict)
+        raw_reviews = [f.dict() for f in resp_obj.findings]
 
         trace_event = {
             "node": "reviewer_step",
@@ -583,7 +595,13 @@ You MUST return ONLY a valid JSON object matching the following structure:
 }
 """
         try:
-            decision: CriticDecision = llm.invoke([HumanMessage(content=prompt)])
+            response = llm.invoke([HumanMessage(content=prompt)])
+            import json
+            raw_text = response.content.strip()
+            if raw_text.startswith("```json"): raw_text = raw_text[7:-3].strip()
+            elif raw_text.startswith("```"): raw_text = raw_text[3:-3].strip()
+            resp_dict = json.loads(raw_text)
+            decision = CriticDecision(**resp_dict)
             final_reviews = [f.dict() for f in decision.kept]
             for d in decision.dropped:
                 dropped.append(d)
