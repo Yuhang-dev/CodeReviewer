@@ -130,11 +130,38 @@ async def github_webhook(request: Request, background_tasks: BackgroundTasks):
             else:
                 pr_number = payload["pull_request"]["number"]
                 
+            import re
+            is_approve_trigger = re.search(r"@(?:bot|ai)\s+approve-rule\s+([a-f0-9\-]+)", comment_body.lower())
+            is_delete_trigger = re.search(r"@(?:bot|ai)\s+delete-rule\s+([a-f0-9\-]+)", comment_body.lower())
             is_refiner_trigger = "[误报]" in comment_body or "[misjudge]" in comment_body.lower()
             is_chat_trigger = "@ai" in comment_body.lower() or "@bot" in comment_body.lower()
             
             # The id of the comment we are replying to
             comment_id = payload.get("comment", {}).get("id")
+
+            if is_approve_trigger:
+                rule_id = is_approve_trigger.group(1)
+                logger.info(f"Processing rule approval for {rule_id}")
+                from app.services.rag import approve_knowledge_rule
+                success = approve_knowledge_rule(rule_id)
+                msg = f"✅ 规则 `{rule_id}` 已成功批准并移入生产环境生效。" if success else f"❌ 批准规则 `{rule_id}` 失败，可能该 ID 不存在或发生了内部错误。"
+                if event_type == "pull_request_review_comment" and comment_id:
+                    background_tasks.add_task(post_pr_review_reply, repo_full_name, pr_number, comment_id, msg)
+                else:
+                    background_tasks.add_task(post_pr_comment, repo_full_name, pr_number, msg)
+                return {"status": "accepted", "message": "Rule approved."}
+
+            if is_delete_trigger:
+                rule_id = is_delete_trigger.group(1)
+                logger.info(f"Processing rule deletion for {rule_id}")
+                from app.services.rag import delete_knowledge_rule
+                success = delete_knowledge_rule(rule_id)
+                msg = f"✅ 规则 `{rule_id}` 已从知识库中彻底删除。" if success else f"❌ 删除规则 `{rule_id}` 失败，可能该 ID 不存在或发生了内部错误。"
+                if event_type == "pull_request_review_comment" and comment_id:
+                    background_tasks.add_task(post_pr_review_reply, repo_full_name, pr_number, comment_id, msg)
+                else:
+                    background_tasks.add_task(post_pr_comment, repo_full_name, pr_number, msg)
+                return {"status": "accepted", "message": "Rule deleted."}
 
             if is_refiner_trigger:
                 logger.info(f"Processing Refiner feedback for {repo_full_name}#{pr_number}")

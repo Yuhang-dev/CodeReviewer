@@ -70,8 +70,9 @@ def ingest_knowledge(
     category: str = "general",
     path_regex: str = ".*",
     language: str = "python",
-    severity: str = "warning"
-) -> int:
+    severity: str = "warning",
+    rule_id: str = None
+) -> list[str]:
     """
     Chunks the input markdown text, generates embeddings, and saves to Qdrant.
     """
@@ -100,7 +101,7 @@ def ingest_knowledge(
     }
     
     payloads = [{"content": chunk, **base_metadata} for chunk in chunks]
-    ids = [str(uuid.uuid4()) for _ in chunks]
+    ids = [rule_id] if rule_id and len(chunks) == 1 else [str(uuid.uuid4()) for _ in chunks]
 
     qdrant_client.upsert(
         collection_name=COLLECTION_NAME,
@@ -111,7 +112,35 @@ def ingest_knowledge(
     )
     
     logger.info(f"Ingested {len(chunks)} chunks successfully.")
-    return len(chunks)
+    return ids
+
+def approve_knowledge_rule(rule_id: str) -> bool:
+    """Approve a staging rule by moving it to production status."""
+    try:
+        from qdrant_client.models import SetPayloadOperation
+        qdrant_client.set_payload(
+            collection_name=COLLECTION_NAME,
+            payload={"status": "production"},
+            points=[rule_id]
+        )
+        logger.info(f"Rule {rule_id} approved and moved to production.")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to approve rule {rule_id}: {e}")
+        return False
+
+def delete_knowledge_rule(rule_id: str) -> bool:
+    """Delete a knowledge rule by ID."""
+    try:
+        qdrant_client.delete(
+            collection_name=COLLECTION_NAME,
+            points_selector=[rule_id]
+        )
+        logger.info(f"Rule {rule_id} deleted successfully.")
+        return True
+    except Exception as e:
+        logger.error(f"Failed to delete rule {rule_id}: {e}")
+        return False
 
 
 def _rewrite_diff_to_intent(diff_text: str) -> str:
@@ -177,9 +206,13 @@ def retrieve_guidelines(query_text: str, filename: str = "", language: str = "py
                     # Hard filtering: if the staging patch scope doesn't match the current file, skip it completely
                     logger.info(f"Filtered out staging patch due to path mismatch: {path_regex} for {filename}")
                     continue
+                status = metadata.get("status", "production")
                 
                 # If matched, apply the patch text
-                guidelines.append(f"【自愈纠偏补丁】: {content}")
+                if status == "staging":
+                    guidelines.append(f"【待审批规则 - 仅供参考】: {content}")
+                else:
+                    guidelines.append(f"【自愈纠偏补丁】: {content}")
                 
                 # Suppress the skill via Route Action
                 action = metadata.get("rule_action", {}).get("action")
@@ -585,7 +618,10 @@ def trigger_refiner_pipeline(diff_text: str, user_comment: str) -> str:
         f"否则为空字符串。严禁写出粗暴的屏蔽规则！\n"
         f"  3. rule_action (dict): 仅 is_false_positive=true 时填写，包含:\n"
         f"     action, skill_name, path_regex, category, language, severity\n"
-        f"     否则为空 dict {{}}\n\n"
+        f"     否则为空 dict {{}}\n"
+        f"  4. confidence (float): 0.0到1.0的综合置信度，评估提炼的规则是否准确、具体、合理且不与常规工程规范矛盾。\n"
+        f"  5. risk (str): 如果接受此规则影响整个仓库的潜在风险，选填 'low', 'medium', 'high'\n"
+        f"  6. reject_reason (str): 如果置信度低于 0.6 或风险为 high，说明拒绝原因。\n\n"
         f"【原始 Diff】:\n{diff_text}\n\n"
         f"【开发者评论】:\n{user_comment}\n\n"
         f"请输出 JSON:"
@@ -613,9 +649,22 @@ def trigger_refiner_pipeline(diff_text: str, user_comment: str) -> str:
                 if not content_to_save:
                     return "❌ 无法提炼有效的规范认知，请尝试更详细地描述误报原因。"
 
+                confidence = parsed_json.get("confidence", 0.0)
+                risk = parsed_json.get("risk", "high")
+                
+                if confidence < 0.6 or risk == "high":
+                    reason = parsed_json.get("reject_reason", "规则置信度过低或风险过高，已被自评拦截。")
+                    logger.info(f"Refiner rejected rule. Confidence: {confidence}, Risk: {risk}. Reason: {reason}")
+                    return f"❌ **提炼的规则未通过 AI 自评拦截**\n\n拦截原因: {reason}\n置信度: {confidence}"
+                
+                status = "production"
+                if confidence < 0.85 or risk == "medium":
+                    status = "staging"
+
                 metadata = {
                     "source": "Self-Reflection Loop",
                     "type": "staging_patch",
+                    "status": status,
                     "path_regex": parsed_json.get("rule_action", {}).get("path_regex", ".*"),
                     "category": parsed_json.get("rule_action", {}).get("category", "general"),
                     "language": parsed_json.get("rule_action", {}).get("language", "python"),
@@ -624,16 +673,29 @@ def trigger_refiner_pipeline(diff_text: str, user_comment: str) -> str:
                     "created_at": datetime.datetime.utcnow().isoformat(),
                 }
                 
-                # 直接调用同文件函数，无需循环 import
-                ingest_knowledge(content_to_save, metadata=metadata)
+                import uuid
+                rule_id = str(uuid.uuid4())
+                ingest_knowledge(content_to_save, metadata=metadata, rule_id=rule_id)
                 
                 rule_name = parsed_json.get("rule_action", {}).get("skill_name", "UNKNOWN")
-                return (
-                    f"✅ **收到误报反馈，自愈机制已启动！**\n\n"
-                    f"已将您的上下文提炼为架构认知补丁并写入知识库。\n"
-                    f"下次命中相同路径的 PR 时，`{rule_name}` 的检查将被软化或拦截。\n\n"
-                    f"> 提炼的认知: *{content_to_save}*"
-                )
+                
+                if status == "staging":
+                    return (
+                        f"📋 **该规则已进入审查暂存区（staging）**\n\n"
+                        f"> 提炼的认知: *{content_to_save}*\n\n"
+                        f"Rule ID: `{rule_id}` (置信度: {confidence}, 风险评估: {risk})\n\n"
+                        f"暂存规则需管理员确认后生效。如需批准，请在此评论回复：`@bot approve-rule {rule_id}`\n"
+                        f"如需删除，请评论：`@bot delete-rule {rule_id}`"
+                    )
+                else:
+                    return (
+                        f"✅ **收到误报反馈，自愈机制已启动！**\n\n"
+                        f"已将您的上下文提炼为架构认知补丁并写入知识库（自动通过预筛）。\n"
+                        f"下次命中相同路径的 PR 时，`{rule_name}` 的检查将被软化或拦截。\n\n"
+                        f"> 提炼的认知: *{content_to_save}*\n\n"
+                        f"Rule ID: `{rule_id}` (置信度: {confidence})\n"
+                        f"如需撤销该规则，请评论：`@bot delete-rule {rule_id}`"
+                    )
             except Exception as e:
                 logger.error(f"Failed to parse Refiner json: {e}")
                 return "❌ 无法解析反馈认知，自愈闭环失败。"
