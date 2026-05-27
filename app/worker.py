@@ -50,9 +50,13 @@ def review_pipeline_job(repo_full_name: str, pr_number: int, commit_id: str, tie
             logger.info("No files modified or failed to fetch files.")
             return
 
-        # Clone the repo for Global Impact AST analysis if Tier requires it
+        # Prepare repo context for Global Impact AST analysis.
+        # Planner may auto-escalate a Tier-B PR to Tier-A/S inside trigger_review_pipeline,
+        # so relying only on the user-requested tier here can make AST analysis skip later.
         repo_path = ""
-        if tier in ["TIER-S", "TIER-A", "Tier-S", "Tier-A"]:
+        has_python_changes = any((f.get("filename") or "").endswith(".py") for f in files_data)
+        should_prepare_ast_context = has_python_changes and tier not in ["TIER-C", "Tier-C"]
+        if should_prepare_ast_context:
             repo_path = shallow_clone_repo(repo_full_name, branch=base_branch)
             if not repo_path:
                 logger.warning(f"Shallow clone failed for branch '{base_branch}'. AST analysis will be skipped.")

@@ -377,19 +377,23 @@ TIER_RANK = {
 }
 
 
-def higher_tier(tier1: Optional[str], tier2: str) -> str:
-    if not tier1:
-        return tier2
+def normalize_tier(tier: Optional[str]) -> str:
+    if not tier:
+        return "Tier-B"
 
-    # Normalize
-    def normalize(t):
-        parts = t.strip().upper().split('-')
-        if len(parts) == 2 and parts[0] in ['TIER', 'TIER']:
-            return f"Tier-{parts[-1]}"
-        return t
-        
-    t1 = normalize(tier1)
-    t2 = normalize(tier2)
+    normalized = tier.strip().upper()
+    if normalized in {"S", "A", "B", "C"}:
+        return f"Tier-{normalized}"
+    if normalized.startswith("TIER-"):
+        suffix = normalized.split("-", 1)[1]
+        if suffix in {"S", "A", "B", "C"}:
+            return f"Tier-{suffix}"
+    return "Tier-B"
+
+
+def higher_tier(tier1: Optional[str], tier2: str) -> str:
+    t1 = normalize_tier(tier1)
+    t2 = normalize_tier(tier2)
 
     rank1 = TIER_RANK.get(t1, 1)  # default B
     rank2 = TIER_RANK.get(t2, 1)
@@ -440,15 +444,6 @@ You MUST return ONLY a valid JSON object matching the following structure:
         plan_dict = json.loads(raw_text)
         plan = PlannerOutput(**plan_dict)
 
-        def normalize_tier(t: str) -> str:
-            if not t: return "Tier-B"
-            parts = t.strip().upper().split('-')
-            if len(parts) == 2 and parts[0] == 'TIER':
-                return f"Tier-{parts[-1]}"
-            if len(parts) == 1 and parts[0] in ['S', 'A', 'B', 'C']:
-                return f"Tier-{parts[0]}"
-            return t
-
         plan.final_tier = normalize_tier(plan.final_tier)
         plan.system_inferred_tier = normalize_tier(plan.system_inferred_tier)
         plan_dict = plan.dict()
@@ -469,7 +464,7 @@ You MUST return ONLY a valid JSON object matching the following structure:
         fallback = {
             "user_requested_tier": user_tier,
             "system_inferred_tier": "Tier-B",
-            "final_tier": user_tier or "Tier-B",
+            "final_tier": normalize_tier(user_tier),
             "tier_resolution_reason": "Fallback due to planner error",
             "selected_checks": ["general"],
             "files": []
@@ -930,8 +925,8 @@ def trigger_review_pipeline(pr_files_data: list[dict], tier: str = "Tier-B", rev
     # 2. Sequential/Parallel Global Impact Analyzer (if tier allows)
     global_warning = ""
     # We use final_plan's tier if available
-    resolved_tier = final_plan.get("final_tier", tier)
-    if resolved_tier in ["TIER-S", "TIER-A", "Tier-S", "Tier-A"]:
+    resolved_tier = normalize_tier(final_plan.get("final_tier", tier))
+    if resolved_tier in ["Tier-S", "Tier-A"]:
         gl_state = {
             "diff_text": combined_diffs,
             "filename": "",
